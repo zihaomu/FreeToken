@@ -21,7 +21,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait, gdc_launch_dependents
 
-from freetoken.utils.arch import is_sm90_supported
+from freetoken.utils.arch import is_rocm, is_sm90_supported
 
 SILU = 0
 GELU = 1
@@ -72,6 +72,7 @@ def _act_and_mul_kernel(
     alpha,
     limit,
     ACT: tl.constexpr,
+    IS_ROCM: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -94,16 +95,25 @@ def _act_and_mul_kernel(
         gdc_launch_dependents()
 
     if ACT == 0:  # SILU: x / (1 + exp(-x)) via ex2.approx
-        act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
+        if IS_ROCM:
+            act = gate * tl.sigmoid(gate)
+        else:
+            act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
         y = act * up
     elif ACT == 2:  # GELU_TANH via tanh.approx
         inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-        act = 0.5 * gate * (1.0 + _fast_tanh(inner))
+        if IS_ROCM:
+            act = 0.5 * gate * (1.0 + libdevice.tanh(inner))
+        else:
+            act = 0.5 * gate * (1.0 + _fast_tanh(inner))
         y = act * up
     elif ACT == 3:  # SWIGLUOAI: clamped gate/up, sigmoid(alpha*gate), (up + 1) bias
         gate = tl.minimum(gate, limit)
         up = tl.minimum(tl.maximum(up, -limit), limit)
-        act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
+        if IS_ROCM:
+            act = gate * tl.sigmoid(gate * alpha)
+        else:
+            act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
         y = act * (up + 1.0)
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
@@ -133,9 +143,20 @@ def _act_and_mul(
     # 1024/w4/s2 best at rows>=4096).
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
+    launch_kwargs = {"launch_pdl": True} if pdl else {}
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        o2,
+        x2,
+        d,
+        alpha,
+        limit,
+        ACT=kind,
+        IS_ROCM=is_rocm(),
+        ENABLE_PDL=pdl,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=num_stages,
+        **launch_kwargs,
     )
     return out
 
