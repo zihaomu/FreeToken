@@ -51,6 +51,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.utils.arch import is_rocm
+
 _SMALL_CAP = 1024  # fused single-CTA path for numel <= this (covers all decode shapes)
 
 
@@ -213,13 +215,14 @@ def _div_ceil(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def moe_align_block_size(
+def _moe_align_triton(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert topk_ids.dtype == torch.int32
-    assert topk_ids.is_contiguous()
+    """The original Triton dispatch. Correct on CUDA; miscompiled by Triton 3.8.0's
+    AMD backend on gfx1101, which is why ROCm routes to _moe_align_torch instead.
+    """
     device = topk_ids.device
     numel = topk_ids.numel()
     effective_E = num_experts + 1  # mirrors fused.py's num_experts+1 convention
@@ -323,6 +326,109 @@ def moe_align_block_size(
     )
 
     return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+def _moe_align_torch(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch moe_align_block_size, used in place of the Triton kernels above.
+
+    WHY: Triton 3.8.0's AMD backend miscompiles the kernels above on gfx1101
+    (silently wrong results, not a crash), so this module routes through here
+    instead until that's fixed upstream.
+
+    Every buffer size below is computed from numel/block_size/num_experts alone,
+    never from tensor *contents* -- no boolean-mask indexing, no bincount, no
+    repeat_interleave-by-tensor, no .item()/tolist()/nonzero, no data-dependent
+    `if`. All shapes are therefore static, so this is safe to call during
+    HIP/CUDA graph capture (a naive torch port that sizes buffers off tensor
+    contents forces a device->host sync there and fails capture outright).
+    """
+    device = topk_ids.device
+    numel = topk_ids.numel()
+    effective_E = num_experts + 1  # mirrors fused.py's num_experts+1 convention
+    NB = effective_E + 1  # one spare bin collects invalid ids
+
+    # Buffer sizes -- mirror freetoken.moe.fused.moe_align_block_size exactly
+    # (unchanged from the original Triton wrapper).
+    if numel < num_experts + 1:
+        max_num_tokens_padded = numel * block_size
+    else:
+        max_num_tokens_padded = numel + (num_experts + 1) * (block_size - 1)
+    max_num_m_blocks = _div_ceil(max_num_tokens_padded, block_size)
+
+    flat = topk_ids.reshape(-1).to(torch.int64)
+    valid = (flat >= 0) & (flat < effective_E)
+    # invalid ids go to the spare bin -- SAME LENGTH as flat, no filtering
+    e = torch.where(valid, flat, torch.full_like(flat, effective_E))
+
+    # counts: fixed NB bins via scatter_add_ (graph-safe), not bincount
+    count_full = torch.zeros(NB, dtype=torch.int64, device=device)
+    count_full.scatter_add_(0, e, torch.ones_like(e))
+    count = count_full[:effective_E]
+
+    nblk = (count + block_size - 1) // block_size  # padded blocks per expert
+    cum_blk = torch.cumsum(nblk, 0)  # inclusive, in block units
+    # cum_blk always has length effective_E >= 1 (num_experts >= 0), so cum_blk[-1]
+    # is safe even when numel == 0 (nblk is then all zeros and cum_blk[-1] == 0).
+    start = (cum_blk - nblk) * block_size  # each expert's first token slot
+    num_tokens_post_pad = (cum_blk[-1] * block_size).to(torch.int32).reshape(1)
+
+    # expert_ids: for block b, the owning expert is searchsorted(cum_blk, b, right=True).
+    # repeat_interleave is banned -- its output length depends on nblk's values.
+    blk = torch.arange(max_num_m_blocks, device=device)
+    eid = torch.searchsorted(cum_blk, blk, right=True)
+    # blocks past the used region must read 0, not a clamped expert id
+    expert_ids = torch.where(blk < cum_blk[-1], eid, torch.zeros_like(eid)).to(torch.int32)
+
+    # sorted_token_ids: argsort over the FULL flat array (static shape [numel]).
+    # Key = expert * (numel+1) + token index: unique composite keys, so the order is
+    # deterministic without stable=True; tokens group by expert, invalid ones
+    # trailing in the spare bin.
+    tok = torch.arange(numel, device=device)
+    order = torch.argsort(e * (numel + 1) + tok)
+    sorted_e = e[order]
+    sorted_tok = tok[order]
+
+    group_start = torch.cumsum(count_full, 0) - count_full  # start rank of each bin
+    # tok doubles here as the sorted-position index -- valid only because both the
+    # token index and the sorted position are arange(numel).
+    rank = tok - group_start[sorted_e]  # 0-indexed rank within bin
+
+    # spare-bin tokens are steered to one trash slot past the real buffer, then dropped
+    start_full = torch.cat([start, start.new_full((1,), max_num_tokens_padded)])
+    dest = start_full[sorted_e] + rank
+    dest = torch.where(
+        sorted_e < effective_E, dest, torch.full_like(dest, max_num_tokens_padded)
+    )
+
+    buf = torch.full((max_num_tokens_padded + 1,), numel, dtype=torch.int32, device=device)
+    buf[dest] = sorted_tok.to(torch.int32)
+    sorted_token_ids = buf[:max_num_tokens_padded]
+
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch: torch on ROCm, the Triton kernels above everywhere else.
+
+    This module is reached whenever ``sgl_kernel`` is absent (see
+    ``freetoken.moe.fused.moe_align_block_size``), which is always the case on
+    ROCm but can also happen on CUDA. Only ROCm is switched over: gating on
+    ``is_rocm()`` leaves the CUDA-without-sgl_kernel path bit-for-bit as it was,
+    rather than changing behaviour on a configuration we cannot test here.
+    """
+    assert topk_ids.dtype == torch.int32
+    assert topk_ids.is_contiguous()
+    if is_rocm():
+        return _moe_align_torch(topk_ids, block_size, num_experts)
+    return _moe_align_triton(topk_ids, block_size, num_experts)
 
 
 __all__ = ["moe_align_block_size"]
