@@ -47,6 +47,10 @@ dependencies = [
     # ceiling: numba (via flashlib) needs numpy<2.5
     "numpy>=2.0,<2.5",
     "openai>=2.0,<3",
+    # floor: 22 is the first release where an unparseable version raises
+    # InvalidVersion instead of returning a LegacyVersion whose .release is
+    # None. moe_align._needs_torch_fallback catches exactly that exception.
+    "packaging>=22,<26",
     "partial-json-parser>=0.2,<1",
     "pillow>=10,<13",
     "prompt_toolkit>=3.0,<4",
@@ -61,9 +65,15 @@ dependencies = [
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
     # CUDA torch 2.11 resolves Triton 3.6; AMD's ROCm 7.14 image supplies its
-    # gfx1201-enabled Triton 3.7 build. Keep both supported without replacing the
-    # runtime-specific wheel selected by the PyTorch distribution.
-    "triton>=3.6,<3.8; platform_system == 'Linux'",
+    # gfx1201-enabled Triton 3.7 build, and the ROCm 10.0 image supplies Triton
+    # 3.8, whose AMD backend miscompiles moe_align on every ROCm target --
+    # moe_align.py's _needs_torch_fallback routes around it there. 3.8 stays
+    # allowed on purpose: the ROCm 10.0 image's torch requires exactly its own
+    # 3.8 build, so excluding it would replace the runtime-specific wheel.
+    # Keep all three versions installable without doing that.
+    # Raising this ceiling needs a matching upper bound in
+    # moe_align._needs_torch_fallback; see its docstring for why.
+    "triton>=3.6,<3.9; platform_system == 'Linux'",
     "uvicorn>=0.30,<1",
 ]
 
