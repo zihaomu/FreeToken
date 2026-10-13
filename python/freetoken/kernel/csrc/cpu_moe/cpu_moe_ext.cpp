@@ -684,57 +684,30 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // 64-bit signals allocated with hipMallocSignalMemory (HIP requires that allocation
 // type for WAIT addresses) and writes the task slot into the single ready signal.
 //
-// HIP's ordinary hipStreamWrite/WaitValue and hipStreamBatchMemOp calls execute while
-// a stream is being captured but, as of ROCm 7.14, are not themselves recorded in the
-// graph. During capture we therefore add explicit batch-memory-op graph nodes and splice
-// them into the stream's current dependency set. The ROCm capability probe below does
-// a real capture + instantiate + replay with a host handshake; eager enqueue alone is
-// deliberately insufficient to enable the path.
+// ROCm 10 captures native HIP write/wait calls into graph nodes. Older runtimes can
+// enqueue them eagerly during capture, so check node capture before probing a real
+// blocking handshake. Only successful capture + instantiate + replay enables it.
 
 #if FREETOKEN_USE_ROCM && defined(HIP_VERSION_MAJOR) && defined(HIP_VERSION_MINOR) && \
     ((HIP_VERSION_MAJOR > 7) || (HIP_VERSION_MAJOR == 7 && HIP_VERSION_MINOR >= 14))
-#define FREETOKEN_HAS_HIP_GRAPH_MEMOPS 1
+#define FREETOKEN_HAS_HIP_FLAG_MEMOPS 1
 #else
-#define FREETOKEN_HAS_HIP_GRAPH_MEMOPS 0
+#define FREETOKEN_HAS_HIP_FLAG_MEMOPS 0
 #endif
 
 #if FREETOKEN_USE_ROCM
 
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
-static hipError_t hip_add_capture_memop_node(
-    hipStream_t stream, hipStreamBatchMemOpParams* ops, unsigned int count) {
-  if (ops == nullptr || count == 0) return hipErrorInvalidValue;
-  hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
-  hipGraph_t graph = nullptr;
-  const hipGraphNode_t* dependencies = nullptr;
-  size_t dependency_count = 0;
-  hipError_t rc = hipStreamGetCaptureInfo_v2(
-      stream, &status, nullptr, &graph, &dependencies, &dependency_count);
+#if FREETOKEN_HAS_HIP_FLAG_MEMOPS
+static hipError_t hipmemop_submit(hipStream_t stream, void* done, void* ready,
+                                int64_t slot) {
+  hipError_t rc = hipStreamWriteValue64(stream, done, 0, hipStreamWriteValueDefault);
   if (rc != hipSuccess) return rc;
-  if (status != hipStreamCaptureStatusActive || graph == nullptr)
-    return hipErrorIllegalState;
+  return hipStreamWriteValue64(
+      stream, ready, static_cast<uint64_t>(slot + 1), hipStreamWriteValueDefault);
+}
 
-  hipCtx_t context = nullptr;
-#if defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif
-  rc = hipCtxGetCurrent(&context);
-#if defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-  if (rc != hipSuccess) return rc;
-
-  hipBatchMemOpNodeParams params{};
-  params.ctx = context;
-  params.count = count;
-  params.paramArray = ops;
-  hipGraphNode_t node = nullptr;
-  rc = hipGraphAddBatchMemOpNode(
-      &node, graph, dependencies, dependency_count, &params);
-  if (rc != hipSuccess) return rc;
-  return hipStreamUpdateCaptureDependencies(
-      stream, &node, 1, hipStreamSetCaptureDependencies);
+static hipError_t hipmemop_wait(hipStream_t stream, void* done, uint64_t value) {
+  return hipStreamWaitValue64(stream, done, value, hipStreamWaitValueGte, UINT64_MAX);
 }
 
 static hipError_t hip_alloc_signal(uint64_t** out) {
@@ -770,32 +743,27 @@ static bool hipmemops_probe(uintptr_t /*stream*/, uintptr_t /*scratch_addr*/) {
   if (rc == hipSuccess) rc = hip_alloc_signal(&done);
   if (rc == hipSuccess) rc = hipStreamCreateWithFlags(&probe_stream, hipStreamNonBlocking);
 
-  hipStreamBatchMemOpParams submit_ops[2]{};
-  submit_ops[0].writeValue.operation = hipStreamMemOpWriteValue64;
-  submit_ops[0].writeValue.address = reinterpret_cast<hipDeviceptr_t>(done);
-  submit_ops[0].writeValue.value64 = 0;
-  submit_ops[1].writeValue.operation = hipStreamMemOpWriteValue64;
-  submit_ops[1].writeValue.address = reinterpret_cast<hipDeviceptr_t>(ready);
-  submit_ops[1].writeValue.value64 = 1;
-  hipStreamBatchMemOpParams sync_op{};
-  sync_op.waitValue.operation = hipStreamMemOpWaitValue64;
-  sync_op.waitValue.address = reinterpret_cast<hipDeviceptr_t>(done);
-  sync_op.waitValue.value64 = 1;
-  sync_op.waitValue.flags = hipStreamWaitValueGte;
-
-  if (rc == hipSuccess)
-    rc = hipStreamBeginCapture(probe_stream, hipStreamCaptureModeRelaxed);
-  const bool capture_started = rc == hipSuccess;
-  if (rc == hipSuccess)
-    rc = hip_add_capture_memop_node(probe_stream, submit_ops, 2);
-  if (rc == hipSuccess)
-    rc = hip_add_capture_memop_node(probe_stream, &sync_op, 1);
-  // Unsupported beta APIs can fail after BeginCapture; end that capture even
-  // on failure so its stream/graph resources are not left active during cleanup.
-  if (capture_started) {
+  auto capture_handshake = [&](uint64_t wait_value) {
+    hipError_t result = hipStreamBeginCapture(probe_stream, hipStreamCaptureModeRelaxed);
+    if (result != hipSuccess) return result;
+    result = hipmemop_submit(probe_stream, done, ready, 0);
+    if (result == hipSuccess) result = hipmemop_wait(probe_stream, done, wait_value);
     hipError_t end_rc = hipStreamEndCapture(probe_stream, &graph);
-    if (rc == hipSuccess) rc = end_rc;
+    return result == hipSuccess ? end_rc : result;
+  };
+
+  // A >=0 wait cannot strand an old runtime's eagerly enqueued capture commands.
+  // Require both writes and the wait to become nodes before trying a blocking wait.
+  if (rc == hipSuccess) rc = capture_handshake(0);
+  if (rc == hipSuccess) rc = hipStreamSynchronize(probe_stream);
+  size_t node_count = 0;
+  if (rc == hipSuccess) rc = hipGraphGetNodes(graph, nullptr, &node_count);
+  if (rc == hipSuccess && node_count != 3) rc = hipErrorNotSupported;
+  if (graph != nullptr) {
+    (void)hipGraphDestroy(graph);
+    graph = nullptr;
   }
+  if (rc == hipSuccess) rc = capture_handshake(1);
   if (rc == hipSuccess)
     rc = hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
 
@@ -846,71 +814,34 @@ static void hipmemop_throw(hipError_t rc, const char* what) {
 }
 
 static void cumemop_submit(uintptr_t stream, uintptr_t done_addr, uintptr_t ready_addr,
-                           int64_t slot, uintptr_t capture_ops_addr = 0) {
-  auto hip_stream = reinterpret_cast<hipStream_t>(stream);
-  auto* done = reinterpret_cast<void*>(done_addr);
-  auto* ready = reinterpret_cast<void*>(ready_addr);
-  hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
-  hipError_t rc = hipStreamIsCapturing(hip_stream, &status);
-  hipmemop_throw(rc, "submit capture-status query");
-  if (status != hipStreamCaptureStatusActive) {
-    hipmemop_throw(
-        hipStreamWriteValue64(hip_stream, done, 0, hipStreamWriteValueDefault),
-        "hipStreamWriteValue64(done)");
-    hipmemop_throw(
-        hipStreamWriteValue64(
-            hip_stream, ready, static_cast<uint64_t>(slot + 1),
-            hipStreamWriteValueDefault),
-        "hipStreamWriteValue64(ready)");
-    return;
-  }
-
-  auto* capture_ops = reinterpret_cast<hipStreamBatchMemOpParams*>(capture_ops_addr);
-  if (capture_ops == nullptr) {
-    throw std::runtime_error(
-        "CPU MoE HIP graph memops require executor-owned parameter storage");
-  }
-  hipmemop_throw(hip_add_capture_memop_node(hip_stream, capture_ops, 2),
-                 "submit graph batch-memory-op");
+                           int64_t slot) {
+  hipmemop_throw(
+      hipmemop_submit(reinterpret_cast<hipStream_t>(stream),
+                      reinterpret_cast<void*>(done_addr),
+                      reinterpret_cast<void*>(ready_addr), slot),
+      "hipStreamWriteValue64(submit)");
 }
 
-static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t /*slot*/,
-                         uintptr_t capture_ops_addr = 0) {
-  auto hip_stream = reinterpret_cast<hipStream_t>(stream);
-  auto* done = reinterpret_cast<void*>(done_addr);
-  hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
-  hipError_t rc = hipStreamIsCapturing(hip_stream, &status);
-  hipmemop_throw(rc, "sync capture-status query");
-  if (status != hipStreamCaptureStatusActive) {
-    hipmemop_throw(
-        hipStreamWaitValue64(
-            hip_stream, done, 1, hipStreamWaitValueGte, UINT64_MAX),
-        "hipStreamWaitValue64(done)");
-    return;
-  }
-
-  auto* capture_ops = reinterpret_cast<hipStreamBatchMemOpParams*>(capture_ops_addr);
-  if (capture_ops == nullptr) {
-    throw std::runtime_error(
-        "CPU MoE HIP graph memops require executor-owned parameter storage");
-  }
-  hipmemop_throw(hip_add_capture_memop_node(hip_stream, capture_ops, 1),
-                 "sync graph batch-memory-op");
+static void cumemop_sync(uintptr_t stream, uintptr_t done_addr, int64_t /*slot*/) {
+  hipmemop_throw(
+      hipmemop_wait(reinterpret_cast<hipStream_t>(stream),
+                    reinterpret_cast<void*>(done_addr), 1),
+      "hipStreamWaitValue64(done)");
 }
 
-#else  // ROCm headers older than the graph batch-memory-op API
+#else  // ROCm headers older than the supported signal-memory API
 
 static bool hipmemops_probe(uintptr_t, uintptr_t) { return false; }
-static void cumemop_submit(uintptr_t, uintptr_t, uintptr_t, int64_t, uintptr_t = 0) {
+static void cumemop_submit(uintptr_t, uintptr_t, uintptr_t, int64_t) {
   throw std::runtime_error(
-      "CPU MoE HIP flag handshake requires ROCm 7.14 graph batch-memory-op APIs");
+      "CPU MoE HIP flag handshake requires HIP stream memory operations");
 }
-static void cumemop_sync(uintptr_t, uintptr_t, int64_t, uintptr_t = 0) {
+static void cumemop_sync(uintptr_t, uintptr_t, int64_t) {
   throw std::runtime_error(
-      "CPU MoE HIP flag handshake requires ROCm 7.14 graph batch-memory-op APIs");
+      "CPU MoE HIP flag handshake requires HIP stream memory operations");
 }
 
-#endif  // FREETOKEN_HAS_HIP_GRAPH_MEMOPS
+#endif  // FREETOKEN_HAS_HIP_FLAG_MEMOPS
 
 static bool cumemops_probe(uintptr_t stream, uintptr_t scratch_addr) {
   return hipmemops_probe(stream, scratch_addr);
@@ -1689,18 +1620,9 @@ struct CpuMoeExecutor {
   volatile int64_t* ready_flags = nullptr;
   volatile int64_t* done_flags = nullptr;
   bool shared_flag_signal = false;
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
+#if FREETOKEN_HAS_HIP_FLAG_MEMOPS
   uint64_t* owned_ready_signal = nullptr;
   uint64_t* owned_done_signal = nullptr;
-  // ROCm 7.14's beta graph API retains hipBatchMemOpNodeParams::paramArray.
-  // There are only two immutable node shapes per task slot (submit has two ops;
-  // sync has one shared op), so allocate one canonical array for each shape once
-  // and let every rebuilt graph reference it. The vector is sized before capture
-  // starts and never resized, keeping addresses stable without a module-global,
-  // append-only allocation. These arrays and the signals now share the executor's
-  // lifetime, which is also the minimum lifetime required by captured CPU-MoE nodes.
-  std::vector<std::array<hipStreamBatchMemOpParams, 2>> hip_graph_submit_ops;
-  std::array<hipStreamBatchMemOpParams, 1> hip_graph_sync_ops{};
 #endif
   int coord_num_slots = 0;
   std::vector<MoeTask*> flag_task;           // slot -> task (registered lazily)
@@ -1941,7 +1863,7 @@ struct CpuMoeExecutor {
   ~CpuMoeExecutor() {
     coord_stop.store(true);
     if (coord_thread.joinable()) coord_thread.join();
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
+#if FREETOKEN_HAS_HIP_FLAG_MEMOPS
     hip_free_signal(owned_ready_signal);
     hip_free_signal(owned_done_signal);
     owned_ready_signal = nullptr;
@@ -2507,11 +2429,10 @@ struct CpuMoeExecutor {
   }
 
   void start_shared_signal_coordinator(int num_slots, int pin_core) {
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
+#if FREETOKEN_HAS_HIP_FLAG_MEMOPS
     if (num_slots <= 0)
       throw std::invalid_argument("CPU MoE HIP flag slot count must be positive");
-    if (owned_ready_signal != nullptr || owned_done_signal != nullptr ||
-        !hip_graph_submit_ops.empty())
+    if (owned_ready_signal != nullptr || owned_done_signal != nullptr)
       throw std::logic_error(
           "CPU MoE HIP flag coordinator is already initialized");
     hipError_t rc = hip_alloc_signal(&owned_ready_signal);
@@ -2528,23 +2449,6 @@ struct CpuMoeExecutor {
     ready_flags = reinterpret_cast<volatile int64_t*>(owned_ready_signal);
     done_flags = reinterpret_cast<volatile int64_t*>(owned_done_signal);
     coord_num_slots = num_slots;
-    hip_graph_submit_ops.clear();
-    hip_graph_submit_ops.resize(num_slots);
-    for (int slot = 0; slot < num_slots; ++slot) {
-      auto& ops = hip_graph_submit_ops[slot];
-      ops[0].writeValue.operation = hipStreamMemOpWriteValue64;
-      ops[0].writeValue.address = reinterpret_cast<hipDeviceptr_t>(owned_done_signal);
-      ops[0].writeValue.value64 = 0;
-      ops[1].writeValue.operation = hipStreamMemOpWriteValue64;
-      ops[1].writeValue.address = reinterpret_cast<hipDeviceptr_t>(owned_ready_signal);
-      ops[1].writeValue.value64 = static_cast<uint64_t>(slot + 1);
-    }
-    hip_graph_sync_ops[0] = {};
-    hip_graph_sync_ops[0].waitValue.operation = hipStreamMemOpWaitValue64;
-    hip_graph_sync_ops[0].waitValue.address =
-        reinterpret_cast<hipDeviceptr_t>(owned_done_signal);
-    hip_graph_sync_ops[0].waitValue.value64 = 1;
-    hip_graph_sync_ops[0].waitValue.flags = hipStreamWaitValueGte;
     {
       std::lock_guard<std::mutex> lk(flag_task_mtx);
       if (static_cast<int>(flag_task.size()) < num_slots) flag_task.resize(num_slots, nullptr);
@@ -2555,50 +2459,36 @@ struct CpuMoeExecutor {
     (void)num_slots;
     (void)pin_core;
     throw std::runtime_error(
-        "CPU MoE HIP signal allocation requires ROCm 7.14 graph memops");
+        "CPU MoE HIP signal allocation requires HIP stream memory operations");
 #endif
   }
 
   void submit_flag_memop(uintptr_t stream, uintptr_t done_addr,
                          uintptr_t ready_addr, int64_t slot) {
-    uintptr_t capture_ops_addr = 0;
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
+#if FREETOKEN_HAS_HIP_FLAG_MEMOPS
     if (shared_flag_signal) {
-      if (slot < 0 || slot >= static_cast<int64_t>(hip_graph_submit_ops.size()))
+      if (slot < 0 || slot >= coord_num_slots)
         throw std::out_of_range("CPU MoE HIP flag slot is out of range");
       if (done_addr != reinterpret_cast<uintptr_t>(owned_done_signal) ||
           ready_addr != reinterpret_cast<uintptr_t>(owned_ready_signal))
         throw std::invalid_argument(
             "CPU MoE HIP memops must use this executor's signal memory");
-      capture_ops_addr =
-          reinterpret_cast<uintptr_t>(hip_graph_submit_ops[slot].data());
     }
 #endif
-    cumemop_submit(stream, done_addr, ready_addr, slot, capture_ops_addr);
+    cumemop_submit(stream, done_addr, ready_addr, slot);
   }
 
   void sync_flag_memop(uintptr_t stream, uintptr_t done_addr, int64_t slot) {
-    uintptr_t capture_ops_addr = 0;
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
+#if FREETOKEN_HAS_HIP_FLAG_MEMOPS
     if (shared_flag_signal) {
-      if (slot < 0 || slot >= static_cast<int64_t>(hip_graph_submit_ops.size()))
+      if (slot < 0 || slot >= coord_num_slots)
         throw std::out_of_range("CPU MoE HIP flag slot is out of range");
       if (done_addr != reinterpret_cast<uintptr_t>(owned_done_signal))
         throw std::invalid_argument(
             "CPU MoE HIP memops must use this executor's signal memory");
-      capture_ops_addr = reinterpret_cast<uintptr_t>(hip_graph_sync_ops.data());
     }
 #endif
-    cumemop_sync(stream, done_addr, slot, capture_ops_addr);
-  }
-
-  size_t graph_memop_param_count() const {
-#if FREETOKEN_HAS_HIP_GRAPH_MEMOPS
-    return hip_graph_submit_ops.size() * 2 +
-           (hip_graph_submit_ops.empty() ? 0 : hip_graph_sync_ops.size());
-#else
-    return 0;
-#endif
+    cumemop_sync(stream, done_addr, slot);
   }
 
   void coordinator_loop() {
@@ -2748,7 +2638,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("slot"))
       .def("sync_flag_memop", &CpuMoeExecutor::sync_flag_memop,
            py::arg("stream"), py::arg("done_addr"), py::arg("slot"))
-      .def("graph_memop_param_count", &CpuMoeExecutor::graph_memop_param_count)
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
@@ -2762,9 +2651,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("enabled"))
       .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); });
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
-  // Preserve the established CUDA-facing module API. ROCm graph capture uses the
-  // executor methods above so its beta node parameter arrays have executor lifetime;
-  // eager ROCm calls remain valid here as well.
+  // CUDA keeps its established module API. ROCm executor methods validate that
+  // write/wait addresses refer to that executor's owned HIP signal allocations.
   m.def("memop_submit",
         [](uintptr_t stream, uintptr_t done_addr, uintptr_t ready_addr, int64_t slot) {
           cumemop_submit(stream, done_addr, ready_addr, slot);
@@ -2777,7 +2665,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         },
         py::arg("stream"), py::arg("done_addr"), py::arg("slot"));
   m.def("memops_use_shared_signal", []() {
-    return static_cast<bool>(FREETOKEN_HAS_HIP_GRAPH_MEMOPS);
+    return static_cast<bool>(FREETOKEN_HAS_HIP_FLAG_MEMOPS);
   });
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act

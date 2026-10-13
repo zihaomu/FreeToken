@@ -80,11 +80,15 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 CPU and hybrid MoE have the same execution semantics on CUDA and ROCm, but use
 backend-specific GPU/CPU synchronization. CUDA retains its mapped-pinned,
-per-slot flag handshake. ROCm 7.14 uses HIP signal memory and explicit Graph
-batch-memory-op nodes whose storage follows the CPU executor's lifetime.
+per-slot flag handshake. The ROCm 10 path uses executor-owned HIP signal memory
+and native `hipStreamWriteValue64` / `hipStreamWaitValue64` calls, which the
+runtime records automatically during graph capture. There are no manually added
+batch-memory-op nodes or executor-owned Graph parameter arrays.
 
 At startup, FreeToken verifies the ROCm path with a real graph capture,
-instantiate, and replay probe. If that probe fails, FreeToken disables CUDA
+instantiate, and replay probe. It first checks that both writes and the wait are
+actually captured using a nonblocking wait, then validates the CPU/GPU handshake.
+If that probe fails, FreeToken disables CUDA
 Graph for CPU/hybrid MoE and continues on the correct eager path. Set
 `FREETOKEN_CPU_MOE_FLAG_SYNC=0` to explicitly disable the native flag handshake;
 on ROCm this also selects the graph-off eager path.
@@ -93,8 +97,10 @@ The same safety check covers `--moe-strategy offload --moe-cpu-layers ...`.
 For tensor parallelism, a failed probe on any rank disables Graph on every rank.
 On ROCm, `auto` does not upgrade offload to hybrid while Graph is enabled,
 because backend selection happens before the executor can run its probe.
-ROCm versions without the graph batch-memory-op APIs use the eager fallback;
-a version number alone does not enable graph replay.
+Older runtimes such as HIP 7.14.60850 execute native memops eagerly during capture
+and are rejected by the probe, selecting the eager fallback. ROCm 10.0 with HIP
+7.15.26333 provides automatic capture; a version number alone does not enable
+graph replay.
 
 ## Notes
 

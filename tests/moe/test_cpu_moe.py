@@ -543,13 +543,8 @@ def test_rocm_cpu_moe_capture_without_flag_sync_fails_closed(monkeypatch):
 
 
 @pytest.mark.skipif(getattr(torch.version, "hip", None) is None, reason="ROCm guard")
-def test_rocm_graph_memop_param_storage_is_bounded_across_rebuilds():
-    """Rebuilding graphs must reuse executor-owned HIP batch-op parameters.
-
-    ROCm 7.14 retains each graph node's ``paramArray`` pointer.  The executor keeps
-    one immutable submit array per flag slot plus one shared wait array, so graph
-    rebuilds must neither invalidate those addresses nor append new storage.
-    """
+def test_rocm_native_graph_memops_track_new_inputs_across_rebuilds():
+    """Native HIP capture must retain correct handshake addresses across rebuilds."""
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     torch.manual_seed(37)
@@ -575,8 +570,6 @@ def test_rocm_graph_memop_param_storage_is_bounded_across_rebuilds():
     executor.decode(0, hidden, weights, ids)  # materialize the task and flag slot
     torch.cuda.synchronize()
 
-    expected_params = 2 * executor._flag_capacity + 1
-    assert executor._ext.graph_memop_param_count() == expected_params
     for rebuild in range(16):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
@@ -591,7 +584,6 @@ def test_rocm_graph_memop_param_storage_is_bounded_across_rebuilds():
             ref = _reference(cache, 0, hidden, ids.cpu(), weights.cpu())
             rel = (out.float().cpu() - ref).abs().max() / (ref.abs().max() + 1e-6)
             assert rel < 2e-2, f"rebuild={rebuild} replay={replay}: {rel}"
-        assert executor._ext.graph_memop_param_count() == expected_params
         del graph, out
 
 
@@ -646,7 +638,28 @@ def test_rocm_graph_memops_support_more_than_sixteen_batch_sizes():
         assert rel < 2e-2, f"bs={bs}: {rel}"
 
     assert len(executor._flag_slots) == len(batch_sizes)
-    assert executor._ext.graph_memop_param_count() == 2 * len(batch_sizes) + 1
+
+
+@pytest.mark.skipif(getattr(torch.version, "hip", None) is None, reason="ROCm guard")
+@pytest.mark.parametrize("slot", [-1, 16])
+def test_rocm_native_flag_memops_reject_out_of_range_slots(slot):
+    """An invalid ready command must never be enqueued on the GPU stream."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    executor = CpuMoeExecutor(
+        _make_cache(1, 4, 64, 32), top_k=2, activation="silu",
+        apply_router_weight_on_input=False, num_threads=2, max_tokens=1,
+        device=torch.device("cuda"), flag_slots_per_layer=16,
+    )
+    if not executor._flag_sync:
+        pytest.skip("native ROCm graph handshake unavailable")
+    stream = torch.cuda.current_stream().cuda_stream
+    done = executor._ext.flag_done_address()
+    ready = executor._ext.flag_ready_address()
+    with pytest.raises(IndexError, match="flag slot is out of range"):
+        executor._ext.submit_flag_memop(stream, done, ready, slot)
+    with pytest.raises(IndexError, match="flag slot is out of range"):
+        executor._ext.sync_flag_memop(stream, done, slot)
 
 
 @pytest.mark.parametrize("overlap", [False, True])

@@ -12,10 +12,10 @@ the current stream:
 CUDA and ROCm expose the same ordering and results; only the GPU/CPU handshake
 implementation differs. CUDA keeps mapped-pinned ready/done arrays and the
 established module-level ``cuStreamWriteValue64``/``cuStreamWaitValue64`` path.
-ROCm 7.14 uses executor-owned ``hipMallocSignalMemory`` signals and explicitly
-adds batch-memory-op nodes during graph capture. The executor also owns the HIP
-node-parameter arrays because captured graphs retain their addresses through
-replay.
+ROCm uses executor-owned ``hipMallocSignalMemory`` signals with native
+``hipStreamWriteValue64``/``hipStreamWaitValue64`` calls in eager and capture.
+ROCm 10 records these calls into graph nodes; older runtimes without automatic
+capture use the eager fallback. No caller-owned Graph parameter arrays are needed.
 
 Only a ROCm handshake that passes a real capture/instantiate/replay probe is
 graph-safe; the Engine disables graph capture and continues eagerly when the
@@ -46,7 +46,7 @@ logger = init_logger(__name__)
 # submit; a persistent CPU coordinator (in _cpu_moe) polls it, runs the layer, and sets
 # the "done" signal the GPU waits on at sync -- no host-func round-trip. CUDA uses
 # mapped-pinned per-slot arrays with cuStreamWriteValue64/cuStreamWaitValue64; ROCm uses
-# executor-owned HIP signal memory and explicit graph batch-memory-op nodes. Both execute
+# executor-owned HIP signal memory and automatically captured native write/wait calls. Both execute
 # on the GPU front end with no SM-resident kernel, so GPU utilization stays truthful
 # during the CPU compute window. (The first cut used a spin-wait kernel; that pinned
 # reported utilization at 99% and laptop CPU/GPU dynamic power schedulers responded by
@@ -715,7 +715,7 @@ class CpuMoeExecutor:
                 )
             else:
                 # Keep CUDA on the established module-level driver-API path.  Only
-                # ROCm needs executor-owned graph parameter storage.
+                # ROCm needs addresses from its executor-owned HIP signal allocations.
                 self._cpu_moe.memop_submit(
                     stream, self._done.data_ptr(), self._ready.data_ptr(), slot
                 )
