@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from .bf16_compat import bf16_mul_compat
+
 
 @triton.jit
 def fused_moe_decode_kernel(
@@ -31,6 +33,7 @@ def fused_moe_decode_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
+    BF16_MUL_WORKAROUND: tl.constexpr,
 ):
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
@@ -59,7 +62,7 @@ def fused_moe_decode_kernel(
             k_mask = offs_k < K - k_start * BLOCK_SIZE_K
             a = tl.load(a_ptrs, mask=k_mask, other=0.0)
             b = tl.load(b_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
-        accumulator += tl.sum(a[:, None] * b, axis=0)
+        accumulator += tl.sum(bf16_mul_compat(a[:, None], b, BF16_MUL_WORKAROUND), axis=0)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
