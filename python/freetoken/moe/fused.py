@@ -84,7 +84,13 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    from freetoken.kernel.backend import is_sgl_kernel_installed
+    from freetoken.kernel.backend import is_rocm, is_sgl_kernel_installed
+
+    if is_rocm():
+        # The histogram-based sorter mislabels expert blocks on RDNA; keep the staged sort.
+        from freetoken.kernel.moe_impl import moe_align_block_size_triton
+
+        return moe_align_block_size_triton(topk_ids, block_size, num_experts)
 
     if not is_sgl_kernel_installed():
         from freetoken.kernel.triton.moe_align import (
