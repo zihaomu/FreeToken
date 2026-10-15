@@ -748,6 +748,39 @@ def test_slot_pools_split_layers_of_one_bank_layout_by_quant_tag():
             assert not view[0].any()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("mixed", [False, True])
+def test_gguf_final_stage_has_mmq_tail_storage(mixed):
+    import numpy as np
+
+    from freetoken.kernel import ggml
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.third_party.gguf import GGMLQuantizationType as QType
+    from freetoken.third_party.gguf import quants
+
+    qtypes = [QType.Q4_0, QType.Q8_0] if mixed else [QType.Q4_0] * 2
+    references, banks = [], []
+    for qtype in qtypes:
+        values = np.random.default_rng(690).normal(0, 0.1, (4, 64, 256)).astype(np.float32)
+        packed = quants.quantize(values, qtype)
+        banks.append(torch.from_numpy(packed).pin_memory())
+        references.append(torch.from_numpy(quants.dequantize(packed, qtype)))
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=12 if mixed else 8, device=torch.device("cuda"),
+        quant_format="gguf", prefill_overlap=True,
+        pool_of_layer=[0, 1] if mixed else [0, 0], pool_sizes=[6, 6] if mixed else [8],
+    )
+    cache.set_bank_sources({"gate_up": banks, "down": banks})
+    x = torch.ones(17, 256, device="cuda")
+    ids = torch.tensor([[0, 3]], dtype=torch.int32, device="cuda").expand(17, -1).contiguous()
+    for layer_id in range(2):
+        stage = cache.stage_views(layer_id, 1)[0]
+        stage.copy_(banks[layer_id], non_blocking=True)
+        actual = ggml.mul_mat_id(stage, int(qtypes[layer_id]), x, ids)
+        expected = references[layer_id][ids.cpu().long()].sum(-1)
+        torch.testing.assert_close(actual.cpu(), expected, atol=3e-3, rtol=3e-3)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_offload_cache_rebuild_frees_the_old_slots_first():
     from freetoken.moe.offload_cache import OffloadMoeCache

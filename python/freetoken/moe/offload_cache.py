@@ -514,13 +514,19 @@ class OffloadMoeCache:
             self._init_prefill_overlap_buffers()
 
     def _alloc_banks(self) -> None:
+        from freetoken.layers.quantization.ggml_types import MATRIX_ROW_PADDING
+
+        # MMQ may read past the final staged matrix; the guard owns no cache slots.
+        padding = MATRIX_ROW_PADDING * torch.float32.itemsize if self.quant_format == "gguf" else 0
         for k, name in enumerate(self.bank_schema):
             if self._raw_banks:
                 nbytes = sum(s * self._row_bytes[self._pool_layout(p)][k] for p, s in enumerate(self.pool_sizes))
-                self.bank_caches[name] = torch.zeros(nbytes, dtype=torch.uint8, device=self.device)
+                self.bank_caches[name] = torch.zeros(nbytes + padding, dtype=torch.uint8, device=self.device)[:nbytes]
             else:
                 dtype, shape = self.layouts[0][k]
-                self.bank_caches[name] = torch.zeros((self.cache_size, *shape), dtype=dtype, device=self.device)
+                count = self.cache_size * math.prod(shape)
+                flat = torch.zeros(count + padding // dtype.itemsize, dtype=dtype, device=self.device)
+                self.bank_caches[name] = flat[:count].view(self.cache_size, *shape)
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
 
     def _build_copy_plan(self) -> None:
