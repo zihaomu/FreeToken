@@ -428,7 +428,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -640,7 +640,14 @@ def test_offload_cache_rebuild_resizes_and_preserves_sources():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
+@pytest.mark.parametrize("hit_d2d", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(
+        torch.version.cuda is None or int(torch.version.cuda.split(".")[0]) < 13,
+        reason="hit-D2D requires CUDA 13 cudaMemcpyBatchAsync",
+    )),
+])
+def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill(hit_d2d):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
@@ -658,7 +665,7 @@ def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
     }
     cache = OffloadMoeCache(
         num_layers=L, num_experts=E, cache_size=33, device=torch.device("cuda"),
-        prefill_overlap=True, prefill_hit_d2d=True, pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10],
+        prefill_overlap=True, prefill_hit_d2d=hit_d2d, pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10],
     )
     cache.set_bank_sources(sources)
     assert [v[1].dtype for v in map(cache.pool_bank_views, range(L))] == [torch.bfloat16, torch.uint8] * 2
@@ -691,7 +698,7 @@ def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
         for (src, _), view in zip(cache.banks, views):
             assert torch.equal(view.cpu(), src[layer])
         cache.release_prefill_layer(layer)
-    assert cache.prefill_hit_rows > 0
+    assert (cache.prefill_hit_rows > 0) == hit_d2d
     for p, stable in enumerate(cache._pool_stable_from):
         if stable:
             assert not any(view[0].any() for view in cache.pool_bank_views(cache.pool_of_layer.index(p)))
