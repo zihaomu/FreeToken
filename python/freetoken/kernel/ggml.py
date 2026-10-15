@@ -136,6 +136,11 @@ def dequantize(w: torch.Tensor, ggml_type: int, k: int, dtype: torch.dtype = tor
 
 
 def get_rows(w: torch.Tensor, ggml_type: int, k: int, ids: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    # ggml converts NVFP4 blocks but has no NVFP4 row-lookup kernel.
+    if ggml_type == GGMLQuantizationType.NVFP4:
+        return dequantize(w.index_select(0, ids.long()), ggml_type, k, dtype)
     out = torch.empty(ids.shape[0], k, dtype=dtype, device=w.device)
     _module().get_rows(w, ggml_type, k, ids, out)
     return out
