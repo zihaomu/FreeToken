@@ -17,8 +17,11 @@ _TOKENIZER_ARCH = {"gemma4": "gemma4_text", "qwen4exp": "qwen3"}
 
 
 def load_gguf_tokenizer(model_path: str):
+    from tokenizers import AddedToken
     from transformers import PreTrainedTokenizerFast
     from transformers.integrations.ggml import convert_gguf_tokenizer
+
+    from freetoken.third_party.gguf import TokenType
 
     meta = load_gguf_metadata(model_path)
     arch = gguf_architecture(model_path)
@@ -31,6 +34,19 @@ def load_gguf_tokenizer(model_path: str):
     fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 
     tokens = tok_dict["tokens"]
+    token_types = tok_dict.get("token_type")
+    if token_types is not None:
+        if len(token_types) != len(tokens):
+            raise ValueError("GGUF tokenizer token types do not match the vocabulary")
+        # The family converter only registers its known markers; GGUF can add more.
+        fast.add_special_tokens([
+            AddedToken(text, normalized=False, special=True)
+            for text, kind in zip(tokens, token_types) if kind == TokenType.CONTROL
+        ])
+        fast.add_tokens([
+            AddedToken(text, normalized=False, special=False)
+            for text, kind in zip(tokens, token_types) if kind == TokenType.USER_DEFINED
+        ])
 
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
