@@ -2,6 +2,53 @@ import pytest
 import torch
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("num_experts", [4, 128])
+@pytest.mark.parametrize("tokens", [1, 4, 80, 129])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("capture", [False, True])
+def test_moe_alignment_matches_cpu_routes(num_experts, tokens, block_size, capture):
+    from freetoken.moe.fused import moe_align_block_size
+
+    topk = min(8, num_experts)
+
+    def routes(seed):
+        ids = torch.randint(num_experts, (tokens, topk), generator=torch.Generator().manual_seed(seed), dtype=torch.int32)
+        ids[-1] = -1
+        return ids
+
+    cpu_ids = routes(690)
+    ids = cpu_ids.cuda()
+    if capture:
+        moe_align_block_size(ids, block_size, num_experts)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sorted_ids, expert_ids, total = moe_align_block_size(ids, block_size, num_experts)
+        cpu_ids = routes(691)
+        ids.copy_(cpu_ids)
+        graph.replay()
+    else:
+        sorted_ids, expert_ids, total = moe_align_block_size(ids, block_size, num_experts)
+
+    flat = cpu_ids.flatten()
+    expected_routes, expected_blocks = [], []
+    for expert in range(num_experts):
+        routed = torch.nonzero(flat == expert).flatten().to(torch.int32)
+        padded = (routed.numel() + block_size - 1) // block_size * block_size
+        expected_routes.append(torch.cat([routed, torch.full((padded - routed.numel(),), flat.numel(), dtype=torch.int32)]))
+        expected_blocks.extend([expert] * (padded // block_size))
+    expected_total = len(expected_blocks) * block_size
+    assert int(total.item()) == expected_total
+    torch.testing.assert_close(expert_ids[:len(expected_blocks)].cpu(), torch.tensor(expected_blocks, dtype=torch.int32))
+    sorted_cpu = sorted_ids.cpu()
+    offset = 0
+    for expected in expected_routes:
+        actual = sorted_cpu[offset:offset + expected.numel()]
+        torch.testing.assert_close(actual.sort().values, expected.sort().values)
+        offset += expected.numel()
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":
