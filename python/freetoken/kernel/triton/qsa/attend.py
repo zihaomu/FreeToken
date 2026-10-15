@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.utils.arch import is_rocm
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
@@ -276,6 +278,10 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+
+    # K/V tiles at N=64, D=256 exhaust RDNA's 64 KiB LDS before reduction scratch.
+    if is_rocm() and head_dim >= 256:
+        block_n = min(block_n, 32)
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
