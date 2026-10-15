@@ -1,9 +1,7 @@
 """The modified and original QSA Triton kernels against pure-torch references.
 
-Only kernels FreeToken changed or wrote get unit tests: the compression kernel (re-addressed
-pending ring, its own torch check) and the block top-k (original radix select, checked against
-torch.topk and, through the expansion chain, against the vLLM reference semantics). score.py
-and attend.py are vendored from vLLM and are covered by the backend and e2e tests.
+The compression kernel, block top-k and sparse attention's ROCm tile profile have independent
+torch checks. score.py is vendored from vLLM and covered by the backend and e2e tests.
 ``_qsa_mqa_paged_reference`` / ``_qsa_relative_topk_reference`` / ``_expand_qsa_indices_reference``
 are transcribed from ``vllm/tests/test_qsa_reference.py`` (Apache-2.0).
 """
@@ -22,6 +20,35 @@ RATIO = 4
 BUDGET = 2048
 INDEX_DIM = 128
 CMP_PAGE = PAGE_SIZE // RATIO
+
+
+@requires_cuda
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("rows", [1, 32])
+def test_sparse_attention_large_heads_matches_torch(head_dim, rows):
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    generator = torch.Generator().manual_seed(690)
+    q = torch.randn(rows, 24, head_dim, generator=generator).to(torch.bfloat16)
+    keys = torch.randn(4, 64, 2, head_dim, generator=generator).to(torch.bfloat16)
+    values = torch.randn(4, 64, 2, head_dim, generator=generator).to(torch.bfloat16)
+    table = torch.tensor([[3, 0], [1, 2]], dtype=torch.int32)
+    requests = torch.arange(rows, dtype=torch.int32) % 2
+    indices = torch.arange(129, dtype=torch.int32).repeat(rows, 1)
+    indices[:, -1] = -1
+    indices[:, 7::11] = -1
+    expected = []
+    for row in range(rows):
+        logical = indices[row][indices[row] >= 0].long()
+        physical = table[requests[row], logical // 64].long()
+        k = keys[physical, logical % 64].float().repeat_interleave(12, dim=1)
+        v = values[physical, logical % 64].float().repeat_interleave(12, dim=1)
+        scores = torch.einsum("hd,shd->hs", q[row].float(), k) / math.sqrt(head_dim)
+        expected.append(torch.einsum("hs,shd->hd", scores.softmax(-1), v))
+    actual = qsa_sparse_paged_attention(
+        q.cuda(), keys.cuda(), values.cuda(), indices.cuda(), table.cuda(), requests.cuda(),
+    )
+    torch.testing.assert_close(actual.cpu().float(), torch.stack(expected), atol=2e-3, rtol=2e-2)
 
 
 # --------------------------------------------------------------------------------------
