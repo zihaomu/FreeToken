@@ -132,3 +132,57 @@ def test_resident_gguf_moe(dtype, batch):
         assert error < 2e-3, error.item()
     else:
         _assert_linear(actual, reference, dtype)
+
+
+@pytest.mark.skipif(torch.version.hip is None, reason="ROCm float expert decode parity")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("capture", [False, True])
+def test_float_gguf_decode_matches_resident_and_slot_banks(dtype, batch, capture):
+    from freetoken.layers.quantization.moe.base import ExpertView
+    from freetoken.layers.quantization.moe.gguf import GgmlMoEKernel
+
+    generator = torch.Generator().manual_seed(690)
+    gate_up = (torch.randn(4, 512, 256, generator=generator) * 0.1).to(dtype).cuda()
+    down = (torch.randn(4, 256, 256, generator=generator) * 0.1).to(dtype).cuda()
+    x = (torch.randn(batch, 256, generator=generator) * 0.1).to(dtype).cuda()
+    ids = torch.tensor([[3, 1]], device="cuda", dtype=torch.int32).repeat(batch, 1)
+    weights = torch.tensor([[0.25, 0.75]], device="cuda").repeat(batch, 1)
+    slots = torch.tensor([5, 1, 7, 3], device="cuda", dtype=torch.int32)
+    cached_gate_up = torch.zeros(9, 512, 256, device="cuda", dtype=dtype)
+    cached_down = torch.zeros(9, 256, 256, device="cuda", dtype=dtype)
+    cached_gate_up[slots.long()] = gate_up
+    cached_down[slots.long()] = down
+    resident = ExpertView({"gate_up": gate_up, "down": down})
+    cached = ExpertView({"gate_up": cached_gate_up, "down": cached_down})
+    cached_ids = slots[ids.long()]
+    qtype = int(QType.BF16 if dtype == torch.bfloat16 else QType.F16)
+
+    def run(strategy, view, expert_ids):
+        layer = SimpleNamespace(
+            quant_method=SimpleNamespace(cfg=SimpleNamespace(strategy=strategy)),
+            activation="gelu_tanh", alpha=1.0, limit=None, apply_router_weight_on_input=False,
+        )
+        return GgmlMoEKernel._apply_float(layer, x.clone(), weights, expert_ids, view, qtype, is_prefill=False)
+
+    run("resident", resident, ids)
+    run("offload", cached, cached_ids)
+    if capture:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run("resident", resident, ids)
+            cache_result = run("offload", cached, cached_ids)
+        graph.replay()
+    else:
+        actual = run("resident", resident, ids)
+        cache_result = run("offload", cached, cached_ids)
+    torch.testing.assert_close(actual, cache_result, atol=0, rtol=0)
+
+    cpu_ids = ids.cpu().long()
+    gu = torch.einsum("tk,tjok->tjo", x.cpu().float(), gate_up.cpu()[cpu_ids].float()).to(dtype).float()
+    gate, up = gu.chunk(2, -1)
+    inter = (F.gelu(gate, approximate="tanh") * up).to(dtype).float()
+    y = torch.einsum("tjk,tjok->tjo", inter, down.cpu()[cpu_ids].float())
+    reference = (y * weights.cpu().unsqueeze(-1)).to(dtype).float().sum(1).to(dtype)
+    torch.testing.assert_close(actual.cpu(), reference, atol=2e-3, rtol=2e-2)

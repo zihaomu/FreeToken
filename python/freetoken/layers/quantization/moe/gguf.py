@@ -93,12 +93,17 @@ class GgmlMoEKernel(MoEKernel):
     @staticmethod
     def _apply_float(layer, x, topk_weights, topk_ids, view: ExpertView, ggml_type: int, *, is_prefill: bool):
         """Float experts: their banks in their own dtype, through the bf16 fused MoE (the unquantized kernel's path)."""
+        from freetoken.kernel.backend import is_rocm
         from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl
 
         gate_up, down = view.tensors["gate_up"], view.tensors["down"]
         if gate_up.dtype != x.dtype:
             raise NotImplementedError(f"GGUF {type_name(ggml_type)} experts need {gate_up.dtype} activations, got {x.dtype}")
-        impl = fused_experts_impl if is_prefill or is_resident(layer) else fused_experts_decode_impl
+        resident_grouped = is_resident(layer)
+        if is_rocm() and x.dtype in (torch.float16, torch.bfloat16):
+            # Match the decode reduction for resident and slot banks to keep greedy tokens stable.
+            resident_grouped = False
+        impl = fused_experts_impl if is_prefill or resident_grouped else fused_experts_decode_impl
         return impl(x, gate_up, down, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, float(layer.alpha), limit_or_inf(layer))
 
 
