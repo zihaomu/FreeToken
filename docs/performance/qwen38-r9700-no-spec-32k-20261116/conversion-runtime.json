@@ -1,0 +1,10 @@
+{
+  "torch": "2.14.0+rocm10.1.0",
+  "hip": "7.16.26385",
+  "triton": "3.8.0",
+  "image": "sha256:a79c374ab2bc93c0e4358da6c7bda5cb84cf1308e8aff74fc99fc95c511cbd03",
+  "pci": "0000:a3:00.0",
+  "hip_library": "/opt/venv/lib/python3.13/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7",
+  "arch": "gfx1201",
+  "native_imports_passed": true
+}

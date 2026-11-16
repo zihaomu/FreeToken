@@ -1,0 +1,12 @@
+{
+  "historical_converter_sha256": "3aebf67f22200c29748db7ef8c75b9af51706a581894f9e102fd60d13d68af42",
+  "portable_converter_sha256": "3090e8f85e018f46f751966d7cae667439d8d5833870f98dbd62ff60c8485eeb",
+  "portable_changes": [
+    "Accept --source/--output instead of historical absolute paths",
+    "Reject existing output directories and require 121 selected matrices",
+    "Prepare unchanged checkpoint hardlinks instead of requiring them in advance",
+    "Format with ast.unparse; quantization and operator checks preserved"
+  ],
+  "new_gpu_execution": false,
+  "prompt_sha256": "e7e3bd61ea7a2997a3791bba19ff56ead844ed47353a548ec12f2de9c89e87a6"
+}

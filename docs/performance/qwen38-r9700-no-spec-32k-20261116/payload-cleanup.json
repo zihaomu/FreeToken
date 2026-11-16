@@ -1,0 +1,75 @@
+{
+  "temporary_weights_removed": true,
+  "reason": "Honor retained preference for one canonical original model; remove only this task-created derivative payload after measurement validation.",
+  "original_checkpoint_untouched": true,
+  "removed": [
+    {
+      "file": "model-00001-of-00010.safetensors",
+      "bytes": 3000811720,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 3000819712
+    },
+    {
+      "file": "model-00002-of-00010.safetensors",
+      "bytes": 9686120528,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9686126592
+    },
+    {
+      "file": "model-00003-of-00010.safetensors",
+      "bytes": 9701693576,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9701699584
+    },
+    {
+      "file": "model-00004-of-00010.safetensors",
+      "bytes": 9686668048,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9686675456
+    },
+    {
+      "file": "model-00005-of-00010.safetensors",
+      "bytes": 9743563504,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9743568896
+    },
+    {
+      "file": "model-00006-of-00010.safetensors",
+      "bytes": 9701702400,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9701707776
+    },
+    {
+      "file": "model-00007-of-00010.safetensors",
+      "bytes": 9686564472,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9686568960
+    },
+    {
+      "file": "model-00008-of-00010.safetensors",
+      "bytes": 9701697968,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 9701703680
+    },
+    {
+      "file": "model-00009-of-00010.safetensors",
+      "bytes": 5028709208,
+      "was_shared_hardlink": false,
+      "unique_allocated_bytes": 5028716544
+    },
+    {
+      "file": "model-00010-of-00010.safetensors",
+      "bytes": 128587536,
+      "was_shared_hardlink": true,
+      "unique_allocated_bytes": 0
+    },
+    {
+      "file": "model-fp8-mtp-ple.safetensors",
+      "bytes": 53717551730,
+      "was_shared_hardlink": true,
+      "unique_allocated_bytes": 0
+    }
+  ],
+  "unique_allocated_bytes_released": 75937587200,
+  "pre_cleanup_measurement_verification_sha256": "ff29ea78f65d21f46b6092d5e540140b124e846f850c4242a9986dee18434a2f"
+}

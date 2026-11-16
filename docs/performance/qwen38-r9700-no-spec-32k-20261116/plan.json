@@ -1,0 +1,39 @@
+{
+  "owner": "qwen38-dense-fp8-32k-20261116-0703",
+  "source": "/home/zihaomu/zihaomu_workspace/freetoken_workspace/freetoken-qwen38-flash-next-4bit-100tps-20261105",
+  "source_commit": "cf32a5364303d71ece7979a6c69857c475555eeb",
+  "model": "/home/zihaomu/zihaomu_workspace/freetoken_workspace/.freetoken-zihao/qwen38-dense-fp8-32k-20261116-0703/derived-dense-fp8",
+  "original_model": "/home/zihaomu/zihaomu_workspace/freetoken_workspace/models/Qwen3.8-Flash-Next-NVFP4-fc694b54",
+  "device": {
+    "physical": 5,
+    "hip_visible": 7,
+    "pci": "0000:a3:00.0",
+    "kfd_gpu_id": 33298
+  },
+  "resource_wall_minutes": 30,
+  "contexts": [
+    32768
+  ],
+  "output_tokens": 256,
+  "measured_repeats": 3,
+  "phases": {
+    "convert": [
+      "convert.py",
+      "convert"
+    ],
+    "dense32k_boot1": [
+      "bench.py",
+      "dense32k_boot1"
+    ],
+    "dense32k_boot2": [
+      "bench.py",
+      "dense32k_boot2"
+    ]
+  },
+  "hypothesis": "Measure original Nov05 denseFP8 hybrid31/fetch1/7610slots configuration at32K instead of512; no DFlash. Retained historical selected source hashes match exactly. No speed extrapolation from512.",
+  "protocol": "Local conversion of121selected dense matrices by preserved per-row absmax/448 E4M3 method; experts unchangedNVFP4. Two fresh sameGPU32K/256 services,1warmup+3measured each; alltails kept. Same32K syntheticarchive prompt; no prefixreuse. Full historical source workingtree read-only. FoundationROCm10.1 launcher and new caches; inherited source native ABI verified before conversion.",
+  "gates": "Exact32768input/256output,modelquantinventory andfixed7610expert slots/BF16KV, Graphenabled,sharedscheduler,hostembedding,hybrid31/fetch1,source/native identity unchanged,no foreignGPU. Startup median decode/TTFTmaxmin<=1.10 descriptive stability screen; if failed retain allsamples and report raw speeds without stable gain claim. No model quality adoption.",
+  "limits": "Historical NUMA interleave0-7 is not reproduced: current workspace policy keeps NUMA/system settings read-only; CPUaffinity32-63,96-127 anddefault memory policy recorded. KVallocation explicitly35072,sequence limit34816 to admit32K; historical logical limit8192 cannot admit32K.",
+  "conversion_storage": "Fresh rewritten affected shards; unchanged files hardlinked read-only by convention. Original checkpoint untouched; no downloads. Enough disk for ~76GB derivative.",
+  "stop": "foreignGPU,conversion/model failure,phase30min,free disk<100GiB,or bothservices complete; no retry-until-fast."
+}

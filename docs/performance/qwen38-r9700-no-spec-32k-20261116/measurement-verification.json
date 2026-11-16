@@ -1,0 +1,234 @@
+{
+  "source_and_native_unchanged": true,
+  "source_checked_files": 872,
+  "historical_selected_source_matches": true,
+  "original_model_unchanged": true,
+  "conversion_qualified": true,
+  "loaded_inventory_checks": [
+    {
+      "phase": "dense32k_boot1",
+      "fp8_matrices": 85,
+      "fp8_weight_bytes": 2900623360,
+      "host_embedding_verified": true
+    },
+    {
+      "phase": "dense32k_boot2",
+      "fp8_matrices": 85,
+      "fp8_weight_bytes": 2900623360,
+      "host_embedding_verified": true
+    }
+  ],
+  "geometry": {
+    "num_pages": 548,
+    "page_size": 64,
+    "moe_cache_size": 7610,
+    "unit_bytes": {
+      "kv_per_token": 25344,
+      "moe_per_expert": 2780160,
+      "mamba_per_slot": 115642376,
+      "swa_per_token": 0
+    }
+  },
+  "same_runtime": {
+    "torch": "2.14.0+rocm10.1.0",
+    "hip": "7.16.26385",
+    "triton": "3.8.0",
+    "pci": "0000:a3:00.0",
+    "image": "sha256:a79c374ab2bc93c0e4358da6c7bda5cb84cf1308e8aff74fc99fc95c511cbd03",
+    "cpu_affinity": [
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127
+    ]
+  },
+  "no_dflash": true,
+  "resources_released": true,
+  "foreign_gpu_observed": false,
+  "startups": [
+    {
+      "phase": "dense32k_boot1",
+      "decode_tok_s_median": 40.61079042262889,
+      "server_decode_tok_s_median": 40.60325453301632,
+      "ttft_s_median": 31.283462292980403,
+      "samples": [
+        {
+          "phase": "dense32k_boot1",
+          "repetition": 1,
+          "decode_tok_s": 40.61079042262889,
+          "server_decode_tok_s": 40.60325453301632,
+          "ttft_s": 31.283462292980403,
+          "text_sha256": "881cc139d97a4d86452ec77f38763610392a2bfc438e030efff735743823b49f",
+          "usage": {
+            "prompt_tokens": 32768,
+            "completion_tokens": 256,
+            "total_tokens": 33024
+          }
+        },
+        {
+          "phase": "dense32k_boot1",
+          "repetition": 2,
+          "decode_tok_s": 39.37500644580882,
+          "server_decode_tok_s": 39.36565159628004,
+          "ttft_s": 31.596696772961877,
+          "text_sha256": "881cc139d97a4d86452ec77f38763610392a2bfc438e030efff735743823b49f",
+          "usage": {
+            "prompt_tokens": 32768,
+            "completion_tokens": 256,
+            "total_tokens": 33024
+          }
+        },
+        {
+          "phase": "dense32k_boot1",
+          "repetition": 3,
+          "decode_tok_s": 40.949914446287025,
+          "server_decode_tok_s": 40.946326289575914,
+          "ttft_s": 30.773519385023974,
+          "text_sha256": "fa67f595a0bb63025925f785041868da29ddeec94037c4bf36e7b3a38ac9c4d9",
+          "usage": {
+            "prompt_tokens": 32768,
+            "completion_tokens": 256,
+            "total_tokens": 33024
+          }
+        }
+      ]
+    },
+    {
+      "phase": "dense32k_boot2",
+      "decode_tok_s_median": 40.025811166810726,
+      "server_decode_tok_s_median": 40.019691867050476,
+      "ttft_s_median": 31.212638731929474,
+      "samples": [
+        {
+          "phase": "dense32k_boot2",
+          "repetition": 1,
+          "decode_tok_s": 40.025811166810726,
+          "server_decode_tok_s": 40.019691867050476,
+          "ttft_s": 30.88892437296454,
+          "text_sha256": "881cc139d97a4d86452ec77f38763610392a2bfc438e030efff735743823b49f",
+          "usage": {
+            "prompt_tokens": 32768,
+            "completion_tokens": 256,
+            "total_tokens": 33024
+          }
+        },
+        {
+          "phase": "dense32k_boot2",
+          "repetition": 2,
+          "decode_tok_s": 40.080609373271585,
+          "server_decode_tok_s": 40.06806947799497,
+          "ttft_s": 31.212638731929474,
+          "text_sha256": "881cc139d97a4d86452ec77f38763610392a2bfc438e030efff735743823b49f",
+          "usage": {
+            "prompt_tokens": 32768,
+            "completion_tokens": 256,
+            "total_tokens": 33024
+          }
+        },
+        {
+          "phase": "dense32k_boot2",
+          "repetition": 3,
+          "decode_tok_s": 27.907383017486914,
+          "server_decode_tok_s": 27.90273660307124,
+          "ttft_s": 55.9368895390071,
+          "text_sha256": "fa67f595a0bb63025925f785041868da29ddeec94037c4bf36e7b3a38ac9c4d9",
+          "usage": {
+            "prompt_tokens": 32768,
+            "completion_tokens": 256,
+            "total_tokens": 33024
+          }
+        }
+      ]
+    }
+  ],
+  "pooled_decode_tok_s_median": 40.053210270041156,
+  "pooled_server_decode_tok_s_median": 40.04388067252272,
+  "pooled_ttft_s_median": 31.248050512454938,
+  "decode_range": [
+    27.907383017486914,
+    40.949914446287025
+  ],
+  "startup_drift_ratios": {
+    "decode_tok_s_median": 1.0146150506077245,
+    "ttft_s_median": 1.002269066760398
+  },
+  "startup_stability_passed": true,
+  "all_texts_one_hash": false,
+  "resources": {
+    "convert": {
+      "samples": 27,
+      "foreign_samples": 0
+    },
+    "dense32k_boot1": {
+      "samples": 74,
+      "foreign_samples": 0
+    },
+    "dense32k_boot2": {
+      "samples": 83,
+      "foreign_samples": 0
+    }
+  },
+  "quality_scope": "Historical conversion method/shapes plus retained operator checks and real32K functional run; no new full-model FP8 quality acceptance.",
+  "limits": "Historical NUMA interleave0-7 is not reproduced: current workspace policy keeps NUMA/system settings read-only; CPUaffinity32-63,96-127 anddefault memory policy recorded. KVallocation explicitly35072,sequence limit34816 to admit32K; historical logical limit8192 cannot admit32K.",
+  "production_adopted": false
+}

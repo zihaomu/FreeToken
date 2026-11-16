@@ -1,0 +1,10 @@
+{
+  "historical_tracked_files_identical": 872,
+  "python_files_syntax_checked": 682,
+  "json_files_validated": 13,
+  "converter_arithmetic_and_checks_ast_identical": true,
+  "readme_links_valid": true,
+  "new_gpu_execution": false,
+  "converter_help_passed": true,
+  "converter_rejects_existing_and_in_source_output": true
+}

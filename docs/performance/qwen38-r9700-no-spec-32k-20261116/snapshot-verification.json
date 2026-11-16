@@ -1,0 +1,31 @@
+{
+  "base_commit": "cf32a5364303d71ece7979a6c69857c475555eeb",
+  "matched_historical_tracked_files": 872,
+  "copied_paths": [
+    "docs/cli.md",
+    "docs/performance/qwen38-r9700-100tps.md",
+    "python/freetoken/engine/config.py",
+    "python/freetoken/kernel/triton/nvfp4_fused_moe.py",
+    "python/freetoken/layers/quantization/moe/nvfp4.py",
+    "python/freetoken/models/qwen4_exp/model.py",
+    "python/freetoken/models/qwen4_exp/ple.py",
+    "python/freetoken/scheduler/config.py",
+    "python/freetoken/scheduler/scheduler.py",
+    "python/freetoken/server/args.py",
+    "tests/models/qwen4_exp/test_ple.py",
+    "tests/moe/test_nvfp4_backends.py",
+    "docs/performance/qwen38-r9700-hybrid-native-fp8-next.md",
+    "docs/performance/qwen38-r9700-native-fp8-closeout.md",
+    "docs/performance/qwen38-r9700-rocm-vs-freetoken.md",
+    "docs/performance/qwen38-r9700-seven-step-plan.md",
+    "docs/performance/qwen38-r9700-stall-attribution.md",
+    "docs/performance/qwen38-r9700-stall-localization.md",
+    "docs/performance/qwen38-r9700-systematic-research-20261106.md",
+    "docs/performance/qwen38-r9700-vma-staging-acceptance.md"
+  ],
+  "source_manifest_sha256": "07e95160b1d18197d812b9ccd61386bf8436d275eff18eb66eae47301a8962a0",
+  "original_worktree_untouched": true,
+  "native_binaries_included": false,
+  "weights_included": false,
+  "source_snapshot_commit": "417c7336fae4370b8273858649124af9642218be"
+}
