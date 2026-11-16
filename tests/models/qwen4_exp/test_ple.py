@@ -689,15 +689,17 @@ def test_verify_commit_matches_stepwise_decode(accepted):
 
 
 @requires_cuda
-def test_decode_graph_replay_matches_eager():
+@pytest.mark.parametrize("prefetch_decode,side_stream", [(True, True), (False, True), (False, False)])
+def test_decode_graph_replay_matches_eager(prefetch_decode, side_stream):
     """A captured decode PLE forward replays to the eager result, table gather included."""
     torch.manual_seed(17)
     config = _config()
     args = config.qwen4_args
     rows, bs = 4096, 4
     layer = _make_layer(config, device="cuda", dtype=torch.bfloat16, rows=rows)
+    layer.prefetch_decode = prefetch_decode
     bank = _pinned_bank(rows, args.ngram_head_dim, torch.float8_e4m3fn)
-    layer.ple_embedding.attach_table(PinnedUVATable(bank.tensor, 0.05))
+    layer.ple_embedding.attach_table(PinnedUVATable(bank.tensor, 0.05, prefetch=side_stream))
 
     ctxp = torch.full((bs + 1, 2), EOS, dtype=torch.int32, device="cuda")
     ctxp[1:] = torch.randint(0, VOCAB, (bs, 2), device="cuda", dtype=torch.int32)

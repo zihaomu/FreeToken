@@ -68,13 +68,16 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
+        if config.scheduler_stream not in ("separate", "shared"):
+            raise ValueError("scheduler_stream must be 'separate' or 'shared'")
         self.engine = Engine(config)
 
-        # use another stream to overlap metadata processing with computation
+        # Sharing the stream preserves the host pipeline while avoiding cross-queue dependencies.
         self.device = self.engine.device
-        self.stream = torch.cuda.Stream(device=self.device)
+        self.stream = self.engine.stream if config.scheduler_stream == "shared" else torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
+        logger.info_rank0("Scheduler stream: %s", config.scheduler_stream)
         # sent on the readiness ack for /v1/stats gpus; a list so TP can add one entry per rank
         self.gpus = [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
 

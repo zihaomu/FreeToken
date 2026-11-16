@@ -39,6 +39,7 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)

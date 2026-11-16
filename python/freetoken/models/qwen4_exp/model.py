@@ -213,8 +213,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
         self._ple_table = table  # owns the pinned HostBank; keep it alive
         for ple in ple_layers:
+            ple.prefetch_decode = engine_config.ple_prefetch == "all"
             ple.ple_embedding.attach_table(
-                PinnedUVATable(table.bank.tensor, float(table.weight_scale))
+                PinnedUVATable(table.bank.tensor, float(table.weight_scale), prefetch=engine_config.ple_prefetch != "none")
             )
         return table.bank.nbytes
 

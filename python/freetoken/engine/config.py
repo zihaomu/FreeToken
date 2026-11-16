@@ -34,6 +34,7 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    ple_prefetch: str = "all"
     # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
     embed_weights: str = "gpu"
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
@@ -118,6 +119,8 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.ple_prefetch not in ("all", "prefill", "none"):
+            raise ValueError("ple_prefetch must be 'all', 'prefill' or 'none'")
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
         if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:

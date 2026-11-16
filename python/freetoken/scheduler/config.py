@@ -18,6 +18,7 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
+    scheduler_stream: str = "separate"
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

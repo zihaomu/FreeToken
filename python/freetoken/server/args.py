@@ -710,6 +710,26 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--scheduler-stream",
+        choices=["separate", "shared"],
+        default=ServerArgs.scheduler_stream,
+        help=(
+            "GPU stream for scheduler metadata operations. 'shared' uses the engine stream while retaining "
+            "the CPU result pipeline and MoE prefill overlap; 'separate' (default) uses a dedicated stream."
+        ),
+    )
+
+    parser.add_argument(
+        "--ple-prefetch",
+        choices=["all", "prefill", "none"],
+        default=ServerArgs.ple_prefetch,
+        help=(
+            "Side-stream gather policy for --ple-backend pinned. 'prefill' gathers decode rows on the "
+            "engine stream while retaining prefill prefetch; 'none' disables the side stream."
+        ),
+    )
+
+    parser.add_argument(
         "--embed-weights",
         default=ServerArgs.embed_weights,
         choices=["gpu", "host"],
