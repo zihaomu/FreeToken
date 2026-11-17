@@ -39,40 +39,58 @@ class TritonNvfp4MoEKernel(MoEKernel):
 
     name = "triton"
     cpu_format = "nvfp4"
+    supports_inactive_slots = True
+    output_replicated = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
+        if cfg.tp_size not in (1, 2):
+            return "triton nvfp4 supports TP=1 or TP=2"
+        if cfg.tp_size > 1:
+            if cfg.strategy != "offload" or cfg.decode_target != "gpu":
+                return "triton nvfp4 TP=2 requires GPU offload; its output-row down banks have no CPU executor"
+            if cfg.intermediate % 2 or cfg.local_intermediate % 64 or cfg.hidden % 128:
+                return "triton nvfp4 TP=2 requires local intermediate divisible by 64 and hidden divisible by 128"
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
+        down_h, down_i = h // cfg.tp_size, cfg.intermediate
         return {
             "gate_up": BankSpec((2 * i, h // 2), torch.uint8),
             "gate_up_scale": BankSpec((2 * i, h // GROUP), FP8),
             "gate_up_global": BankSpec((2 * i,), torch.float32),
-            "down": BankSpec((h, i // 2), torch.uint8),
-            "down_scale": BankSpec((h, i // GROUP), FP8),
-            "down_global": BankSpec((h,), torch.float32),
+            "down": BankSpec((down_h, down_i // 2), torch.uint8),
+            "down_scale": BankSpec((down_h, down_i // GROUP), FP8),
+            "down_global": BankSpec((down_h,), torch.float32),
         }
 
     def pack(self, pieces, cfg: MoEConfig, out):
-        out["gate_up"].copy_(fused_piece(pieces, "gate_up"))
-        out["gate_up_scale"].copy_(fused_piece(pieces, "gate_up_scale"))
-        out["gate_up_global"].copy_(fused_global(pieces, cfg.intermediate))
-        out["down"].copy_(pieces["down"])
-        out["down_scale"].copy_(pieces["down_scale"])
-        out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden))
+        i = cfg.local_intermediate
+        start = cfg.tp_rank * i
+        for role in ("gate_up", "gate_up_scale", "gate_up_global"):
+            full = fused_global(pieces, cfg.intermediate) if role.endswith("_global") else fused_piece(pieces, role)
+            gate, up = full.split(cfg.intermediate, dim=1)
+            out[role].copy_(torch.cat((gate[:, start:start + i], up[:, start:start + i]), dim=1))
+        rows = cfg.hidden // cfg.tp_size
+        begin = cfg.tp_rank * rows
+        out["down"].copy_(pieces["down"][:, begin:begin + rows])
+        out["down_scale"].copy_(pieces["down_scale"][:, begin:begin + rows])
+        out["down_global"].copy_(global_rows(pieces["down_global"], cfg.hidden)[:, begin:begin + rows])
         return {}
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4
+        from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin, fused_experts_nvfp4, fused_experts_nvfp4_tp2
 
         t = view.tensors
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         alpha, limit = float(layer.alpha), limit_or_inf(layer)
+        if t["down"].shape[1] != x.shape[1]:
+            return fused_experts_nvfp4_tp2(x, *banks, topk_weights, topk_ids, view.n, layer.activation,
+                                          layer.apply_router_weight_on_input, alpha, limit, is_prefill=is_prefill)
         if is_prefill:
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
@@ -87,6 +105,8 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
     name = "w4a4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        if cfg.tp_size > 1:
+            return "W4A4 NVFP4 TP > 1 is not supported; use triton"
         reason = super().unusable_reason(cfg)
         if reason:
             return reason

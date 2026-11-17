@@ -23,6 +23,26 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("code,status", [(None, 400), ("backend_unavailable", 503)])
+def test_completion_preserves_backend_error_class(stream, code, status):
+    state = FakeState([UserReply(uid=42, incremental_output="", finished=True,
+                                 error="worker is gone", error_code=code)])
+    response = run(handle_completion(CompletionRequest(model="m", prompt="hello", stream=stream),
+                                     request=None, state=state, model_sampling={}))
+    if stream:
+        async def consume():
+            return [chunk async for chunk in response.body_iterator]
+        chunks = run(consume())
+        body = json.loads(chunks[0].decode().removeprefix("data: ").strip())
+        assert chunks[-1] == b"data: [DONE]\n\n"
+    else:
+        assert response.status_code == status
+        body = json.loads(response.body)
+    assert body["error"]["code"] == code
+    assert body["error"]["type"] == ("server_error" if status == 503 else "invalid_request_error")
+
+
 class FakeState:
     def __init__(
         self,

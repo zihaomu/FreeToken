@@ -624,3 +624,200 @@ def test_checkpoint_disagreeing_with_its_quant_config_is_rejected(tmp_path, quan
     (tmp_path / "config.json").write_text(json.dumps(_config_json(quantization_config)))
     with pytest.raises(ValueError, match=match):
         _load(str(tmp_path))
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp2_loader_preserves_gdn_head_groups_and_replicated_branches(checkpoint, monkeypatch, rank):
+    from freetoken.distributed import info
+
+    folder, raw = checkpoint
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank, 2))
+    local = _load(folder, vision=False)
+    gdn = f"{LM}.layers.0.linear_attn"
+    q, k, v = raw[f"{gdn}.in_proj_qkv.weight"].split([KH * HD, KH * HD, VH * HD])
+    qkvzba = torch.cat([q, k, v, *(raw[f"{gdn}.in_proj_{p}.weight"] for p in ("z", "b", "a"))])
+    torch.testing.assert_close(local["model.layers.0.linear_attn.in_proj.weight"], qkvzba, rtol=0, atol=0)
+    cv = raw[f"{gdn}.conv1d.weight"].split([KH * HD, KH * HD, VH * HD])
+    torch.testing.assert_close(local["model.layers.0.linear_attn.conv1d.weight"], torch.cat([
+        t[rank * (t.shape[0] // 2):(rank + 1) * (t.shape[0] // 2)] for t in cv
+    ]), rtol=0, atol=0)
+    for p in ("A_log", "dt_bias"):
+        torch.testing.assert_close(local[f"model.layers.0.linear_attn.{p}"], raw[f"{gdn}.{p}"][rank * VH // 2:(rank + 1) * VH // 2], rtol=0, atol=0)
+    attn = f"{LM}.layers.1.self_attn"
+    qkv = local["model.layers.1.self_attn.qkv_proj.weight"].split([2 * QH * AHD, KVH * AHD, KVH * AHD])
+    for p, t in zip("qkv", qkv):
+        full = raw[f"{attn}.{p}_proj.weight"]
+        torch.testing.assert_close(t, full, rtol=0, atol=0)
+    shared = f"{LM}.layers.0.mlp.shared_expert"
+    expected = torch.cat([raw[f"{shared}.{p}_proj.weight"] for p in ("gate", "up")])
+    torch.testing.assert_close(local["model.layers.0.mlp.shared_expert.gate_up_proj.weight"], expected, rtol=0, atol=0)
+    for key in ("model.layers.0.linear_attn.out_proj.weight", "model.layers.1.self_attn.o_proj.weight", "model.layers.0.mlp.shared_expert.down_proj.weight"):
+        full = raw[key.replace("model.", LM + ".", 1)]
+        torch.testing.assert_close(local[key], full, rtol=0, atol=0)
+    for key in ("model.layers.0.ple.key_proj.weight", "model.layers.0.ple.value_proj.weight", "model.layers.1.self_attn.indexer.index_qk_proj.weight", "model.hyper_connection_mixer.input_mix_weight_down.weight", "model.layers.0.mlp.gate.weight"):
+        torch.testing.assert_close(local[key], raw[key.replace("model.", LM + ".", 1)], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_tp2_nvfp4_pack_reconstructs_independent_expert_math(fused):
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
+
+    torch.manual_seed(17)
+    h, inter = 128, 640
+    codebook = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.])
+    pieces = {}
+    weights = {}
+    for p, rows, cols, global_scale in (("gate", inter, h, .25), ("up", inter, h, .5), ("down", h, inter, .125)):
+        codes = torch.randint(0, 16, (1, rows, cols))
+        packed = (codes[..., ::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
+        scale = (torch.rand(1, rows, cols // 16) + .25).to(torch.float8_e4m3fn)
+        pieces[p] = packed
+        pieces[p + "_scale"] = scale
+        pieces[p + "_global"] = torch.tensor([[global_scale]])
+        weights[p] = codebook[codes] * scale.float().repeat_interleave(16, -1) * global_scale
+    if fused:
+        for suffix in ("", "_scale", "_global"):
+            a, b = pieces.pop("gate" + suffix), pieces.pop("up" + suffix)
+            if suffix == "_global":
+                a, b = a.expand(-1, inter), b.expand(-1, inter)
+            pieces["gate_up" + suffix] = torch.cat([a, b], dim=1)
+    x = torch.randn(h) / 8
+    ref = weights["down"][0] @ (torch.nn.functional.silu(weights["gate"][0] @ x) * (weights["up"][0] @ x))
+    activations, downs = [], []
+    kernel = TritonNvfp4MoEKernel()
+    for rank in (0, 1):
+        cfg = MoEConfig(1, h, inter, 1, tp_rank=rank, tp_size=2, strategy="offload")
+        assert kernel.unusable_reason(cfg) is None
+        out = {k: torch.empty((1, *s.shape), dtype=s.dtype) for k, s in kernel.layout(cfg).items()}
+        kernel.pack(pieces, cfg, out)
+        decoded = {}
+        for role in ("gate_up", "down"):
+            packed = out[role].long()
+            codes = torch.stack([packed & 15, packed >> 4], dim=-1).flatten(-2)
+            decoded[role] = codebook[codes] * out[role + "_scale"].float().repeat_interleave(16, -1) * out[role + "_global"].unsqueeze(-1)
+        gate, up = decoded["gate_up"][0].split(inter // 2)
+        activations.append(torch.nn.functional.silu(gate @ x) * (up @ x))
+        downs.append(decoded["down"][0])
+    full_activation = torch.cat(activations)
+    result = torch.cat([down @ full_activation for down in downs])
+    torch.testing.assert_close(result, ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("size", [1, 2])
+def test_index_remaps_fp8_dense_without_rewriting_expert_shards(checkpoint, tmp_path, monkeypatch, size):
+    """The index can select new FP8 tensors while the old BF16 names remain in shared shards."""
+    import hashlib
+    from pathlib import Path
+    import safetensors
+    from freetoken.distributed import info
+
+    raw = dict(checkpoint[1])
+    modules = [f"{LM}.layers.0.linear_attn.in_proj_{p}" for p in ("qkv", "z")]
+    config = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0, 1))
+    for module in modules:
+        config["quantized_layers"][module] = {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"}
+    folder, _ = _write_checkpoint(tmp_path, raw, config)
+    mapping, hashes = {}, {}
+    for path in Path(folder).glob("*.safetensors"):
+        hashes[path] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with safetensors.safe_open(path, framework="pt") as f:
+            mapping.update({key: path.name for key in f.keys()})
+    converted = {}
+    for module in modules:
+        weight = raw[module + ".weight"].float()
+        scale = weight.abs().amax(1).div(448).clamp_min(1e-12)
+        converted[module + ".weight"] = (weight / scale[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+        converted[module + ".weight_scale"] = scale
+    save_file(converted, str(tmp_path / "dense-fp8.safetensors"))
+    mapping.update({key: "dense-fp8.safetensors" for key in converted})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": mapping}))
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(0, size))
+    loaded = _load(folder, vision=False)
+    for role in ("weight", "weight_scale"):
+        want = torch.cat([converted[module + "." + role] for module in modules])
+        actual = loaded["model.layers.0.linear_attn.in_proj_qkvz." + role]
+        assert torch.equal(actual.view(torch.uint8), want.view(torch.uint8))
+    assert all(hashlib.sha256(path.read_bytes()).hexdigest() == sha for path, sha in hashes.items())
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("fault", [None, "missing_scale", "short_scale", "negative_scale", "blocked_module", "mixed_options"])
+def test_tp2_row_fp8_weight_scale_and_head_order(checkpoint, tmp_path, monkeypatch, rank, fault):
+    """Wrong scale/head rows and QKV splitting can load cleanly while computing wrong logits."""
+    from freetoken.distributed import info
+    from freetoken.layers.linear_attn.gdn import GatedDeltaNet
+    from freetoken.layers.quantization import QuantBackend, get_quant_config, set_quant_backend
+    from freetoken.models.qwen4_exp.tp import preserve_tp_dense_math
+
+    raw = dict(checkpoint[1])
+    gdn = f"{LM}.layers.0.linear_attn"
+    selected = [f"{gdn}.{p}" for p in ("in_proj_qkv", "in_proj_z", "out_proj")]
+    selected += [f"{LM}.layers.1.self_attn.o_proj", "lm_head"]
+    config = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0, 1))
+    config["ignore"].remove("lm_head")
+    if fault == "blocked_module":
+        selected.append(f"{LM}.layers.1.self_attn.q_proj")
+    for module in selected:
+        weight = raw[module + ".weight"]
+        raw[module + ".weight"] = weight.to(torch.float8_e4m3fn)
+        raw[module + ".weight_scale"] = torch.arange(weight.shape[0], dtype=torch.float32).div(1000).add(.01)
+        config["quantized_layers"][module] = {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"}
+    scale_key = selected[0] + ".weight_scale"
+    if fault == "missing_scale":
+        del raw[scale_key]
+    elif fault == "short_scale":
+        raw[scale_key] = raw[scale_key][:-1]
+    elif fault == "negative_scale":
+        raw[scale_key] = -raw[scale_key]
+    elif fault == "mixed_options":
+        monkeypatch.setenv("FREETOKEN_QWEN38_TP_GDN_INPUT", "local")
+    folder, _ = _write_checkpoint(tmp_path, raw, config)
+    monkeypatch.setattr(info, "_TP_INFO", info.DistributedInfo(rank, 2))
+    if fault:
+        errors = {"missing_scale": "missing tensors", "short_scale": "positive scale per output row",
+                  "negative_scale": "positive scale per output row", "blocked_module": "unsupported dense scheme",
+                  "mixed_options": "requires the R0w TP options"}
+        with pytest.raises((ValueError, NotImplementedError), match=errors[fault]):
+            _load(folder, vision=False)
+        return
+    install_quant_config(folder)
+    loaded = dict(iter_weights(folder, torch.device("cpu"), include_moe_experts=False,
+                               include_non_moe=True, include_vision=False))
+    set_quant_backend(QuantBackend.parse("linear.fp8_tensor=emulation"))
+    dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        op = GatedDeltaNet(H, KH, VH, HD, HD, 4, 1e-6, 0,
+                           quant_config=get_quant_config(), prefix="model.layers.0.linear_attn")
+        preserve_tp_dense_math(op)
+        for attr in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
+            prefix = f"model.layers.0.linear_attn.{attr}."
+            layer = getattr(op, attr)
+            layer.load_state_dict({k.removeprefix(prefix): v for k, v in loaded.items() if k.startswith(prefix)})
+        x = torch.linspace(-.1, .1, 3 * H).reshape(3, H)
+        full_w = torch.cat([raw[f"{gdn}.in_proj_{p}.weight"].float() for p in ("qkv", "z")])
+        full_s = torch.cat([raw[f"{gdn}.in_proj_{p}.weight_scale"] for p in ("qkv", "z")])
+        assert torch.equal(op.in_proj_qkvz.weight.view(torch.uint8), full_w.to(torch.float8_e4m3fn).view(torch.uint8))
+        assert torch.equal(op.in_proj_qkvz.weight_scale, full_s)
+        sizes = [KH * HD, KH * HD, VH * HD, VH * HD]
+        ref = x.float() @ (full_w * full_s[:, None]).t()
+        expected = torch.cat([p[:, rank * (n // 2):(rank + 1) * (n // 2)]
+                              for p, n in zip(ref.split(sizes, -1), sizes)], -1)
+        torch.testing.assert_close(op.in_proj_qkvz.forward(x).float(), expected, rtol=.02,
+                                   atol=.02 * float(expected.square().mean().sqrt()))
+        ba = torch.cat([raw[f"{gdn}.in_proj_{p}.weight"] for p in ("b", "a")])
+        expected_ba = torch.cat([p[:, rank * VH // 2:(rank + 1) * VH // 2]
+                                 for p in torch.nn.functional.linear(x, ba).split(VH, -1)], -1)
+        torch.testing.assert_close(op.in_proj_ba.forward(x), expected_ba, rtol=0, atol=0)
+        rows = (len(raw["lm_head.weight"]) + 1) // 2
+        for suffix in ("weight", "weight_scale"):
+            actual = loaded[f"lm_head.{suffix}"]
+            want = raw[f"lm_head.{suffix}"][rank * rows:(rank + 1) * rows]
+            assert actual.shape[0] == rows
+            assert actual.untyped_storage().nbytes() == actual.numel() * actual.element_size()
+            assert torch.equal(actual[:len(want)].view(torch.uint8), want.view(torch.uint8))
+            if len(want) < rows:
+                assert bool((actual[len(want):].float() == (1 if suffix == "weight_scale" else 0)).all())
+    finally:
+        torch.set_default_dtype(dtype)

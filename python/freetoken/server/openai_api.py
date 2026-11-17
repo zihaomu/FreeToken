@@ -142,7 +142,7 @@ def register_openai_routes(
         efforts, default_effort = await _effort_fields(state)
         return ModelList(data=[ModelCard(
             id=model_id,
-            root=state.config.model_path,
+            root=getattr(getattr(state.config, "native_config", None), "model", state.config.model_path),
             max_model_len=ctx,
             context_length=ctx,
             supported_reasoning_efforts=efforts,
@@ -279,7 +279,7 @@ async def stream_chat_completion_chunks(
             # Request failed before producing output — emit an error chunk + [DONE] so the
             # client gets a terminal signal instead of a stalled stream.
             yield _sse(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
+                {"error": {"message": str(exc), "type": "server_error" if exc.code == "backend_unavailable" else "invalid_request_error", "code": exc.code}}
             )
             break
         if isinstance(ev, ReasoningDelta):
@@ -458,7 +458,7 @@ async def handle_completion(
         finish_reason = "stop"
         async for ack in state.wait_for_ack(uid):
             if getattr(ack, "error", None):
-                return create_error_response(ack.error)
+                return create_error_response(ack.error, code=getattr(ack, "error_code", None))
             prompt_tokens += ack.prompt_tokens_delta
             completion_tokens += ack.completion_tokens_delta
             cached_tokens += ack.cached_tokens
@@ -492,7 +492,8 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
-            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
+            code = getattr(ack, "error_code", None)
+            yield _sse({"error": {"message": ack.error, "type": "server_error" if code == "backend_unavailable" else "invalid_request_error", "code": code}})
             yield b"data: [DONE]\n\n"
             return
         prompt_tokens += ack.prompt_tokens_delta
@@ -557,6 +558,8 @@ def create_error_response(
     param: str | None = None,
     code: str | None = None,
 ) -> JSONResponse:
+    if code == "backend_unavailable":
+        status_code, err_type = 503, "server_error"
     return JSONResponse(
         status_code=status_code,
         content={

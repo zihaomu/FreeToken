@@ -49,6 +49,7 @@ class UserReply(BaseFrontendMsg):
     # predicted counts, draft counters), passthrough of DetokenizeMsg.timings: present on
     # the terminal reply of a served request, None otherwise.
     timings: dict | None = None
+    native_stats: dict | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

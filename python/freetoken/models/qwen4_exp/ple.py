@@ -582,14 +582,16 @@ class PLELayer(BaseOP):
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
         self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        self.prefetch_decode = True
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
-        """Hash this forward's n-grams and start the table gather on the side stream."""
+        """Prepare this forward's n-gram rows and optionally start the table gather."""
         if meta is None:
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
         row_ids = self.ple_embedding.row_ids(meta)
         self._pending = (meta, row_ids)
-        self.ple_embedding.table.prefetch(row_ids)
+        if batch.is_prefill or self.prefetch_decode:
+            self.ple_embedding.table.prefetch(row_ids)
 
     def forward(
         self,

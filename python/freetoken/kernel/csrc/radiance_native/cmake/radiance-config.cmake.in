@@ -1,0 +1,85 @@
+# radiance-config.cmake -- what `find_package(radiance)` gets.
+#
+# Lets a plugin in another repository build against the installed ABI headers and install into
+# the $RADIANCE_HOME the engine's loader scans.
+#
+# What a consumer gets:
+#   radiance::abi              the header-only ABI target -- abi/ plus RAD_DEFAULT_HOME,
+#                              RAD_HAVE_HIP and the ROCm include path, exactly as the engine's own
+#                              plugins were compiled with them
+#   rad_add_plugin()           the same function radiance builds its own plugins with
+#   RADIANCE_ABI_VERSION       the number the loader compares against, so a consumer can refuse at
+#                              configure time rather than at dlopen
+#   RADIANCE_HOME              the installed $RADIANCE_HOME; `cmake --install` puts a plugin
+#                              built with rad_add_plugin under it (RAD_PLUGIN_INSTALL_HOME)
+#   RADIANCE_KERNELS_DIR       ${RADIANCE_HOME}/kernels
+#   RADIANCE_ARCHITECTURES_DIR ${RADIANCE_HOME}/architectures
+#   RADIANCE_QUANTIZERS_DIR    ${RADIANCE_HOME}/quantizers
+#   RADIANCE_INCLUDE_DIR       the include root, for a consumer that wants the path rather than the
+#                              target (arch/common/ is installed under ${RADIANCE_INCLUDE_DIR}/arch)
+#   RAD_GPU_TARGETS            the offload architectures a device plugin is compiled for: the
+#                              consumer's -DRAD_GPU_TARGETS when given, else the ones radiance was
+#                              built for. The engine itself runs on every AMD GPU family.
+
+@PACKAGE_INIT@
+
+# Read from abi/rad_abi.h at radiance's configure time, so the header stays the single source.
+set(RADIANCE_ABI_VERSION @RAD_ABI_VERSION@)
+
+set_and_check(RADIANCE_INCLUDE_DIR "@PACKAGE_RAD_INCLUDE_RELDIR@")
+
+# $RADIANCE_HOME as a CACHE PATH, so a consumer can override it. Relative to PACKAGE_PREFIX_DIR, so
+# a relocated prefix still resolves.
+set(RADIANCE_HOME "@PACKAGE_RAD_HOME_RELDIR@" CACHE PATH
+    "\$RADIANCE_HOME of the radiance installation found by find_package(radiance)")
+set(RADIANCE_KERNELS_DIR       "${RADIANCE_HOME}/kernels")
+set(RADIANCE_ARCHITECTURES_DIR "${RADIANCE_HOME}/architectures")
+set(RADIANCE_QUANTIZERS_DIR    "${RADIANCE_HOME}/quantizers")
+# Where rad_add_plugin installs: the home of the engine this consumer built against. Override to
+# install elsewhere.
+set(RAD_PLUGIN_INSTALL_HOME "${RADIANCE_HOME}" CACHE PATH
+    "the \$RADIANCE_HOME rad_add_plugin installs plugins under")
+
+# The imported targets, including radiance::abi.
+include("${CMAKE_CURRENT_LIST_DIR}/radianceTargets.cmake")
+
+# Device-build facts rad_add_plugin needs, recorded at radiance's configure time under the in-tree
+# names. The target list is carried over, not re-detected: a plugin built for the wrong gfx target
+# loads and launches, then computes garbage.
+set(RAD_HIP_FOUND    @RAD_HIP_FOUND@)
+if(NOT DEFINED RAD_GPU_TARGETS)
+  set(RAD_GPU_TARGETS "@RAD_GPU_TARGETS@")
+endif()
+# The HIP runtime and headers as radiance found them, or this machine's copies when the recorded
+# path does not exist (another machine, or a container with ROCm elsewhere).
+set(RAD_HIP_RUNTIME  "@RAD_HIP_RUNTIME@")
+if(RAD_HIP_FOUND)
+  if(NOT EXISTS "${RAD_HIP_RUNTIME}")
+    find_library(RAD_HIP_RUNTIME_HERE amdhip64 HINTS ENV ROCM_PATH ENV HIP_PATH /opt/rocm
+                 PATH_SUFFIXES lib lib64)
+    set(RAD_HIP_RUNTIME "${RAD_HIP_RUNTIME_HERE}")
+  endif()
+  set(_rad_rocm_inc "@RAD_ROCM_INCLUDE@")
+  if(NOT EXISTS "${_rad_rocm_inc}/hip/hip_runtime.h")
+    find_path(_rad_rocm_inc_here hip/hip_runtime.h HINTS ENV ROCM_PATH ENV HIP_PATH /opt/rocm
+              PATH_SUFFIXES include)
+    set(_rad_rocm_inc "${_rad_rocm_inc_here}")
+  endif()
+  if(_rad_rocm_inc)
+    set_property(TARGET radiance::abi APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${_rad_rocm_inc}")
+    set_property(TARGET radiance::abi APPEND PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_rad_rocm_inc}")
+  endif()
+endif()
+
+# The consumer's build-tree $RADIANCE_HOME, so a plugin can be tested with
+# RADIANCE_HOME=<build dir>/radiance_home before install. A value already set is kept.
+if(NOT DEFINED RAD_PLUGIN_OUT)
+  set(RAD_PLUGIN_OUT ${CMAKE_BINARY_DIR}/radiance_home)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/RadAddPlugin.cmake")
+if(RAD_HIP_FOUND)
+  rad_hip_rule_fixes()
+endif()
+
+check_required_components(radiance)

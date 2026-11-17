@@ -19,9 +19,10 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated, LinearRowParallel
 from freetoken.layers.rotary import get_rope
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import div_even, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -118,18 +119,21 @@ class Qwen4ExpAttention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        tp = get_tp_info()
+        tp_size = self._tp_size = tp.size
+        self._tp_rank = tp.rank
+        self.num_q = div_even(config.num_qo_heads, tp_size)
+        self.num_kv = div_even(config.num_kv_heads, tp_size)
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
         self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
+            config.hidden_size, [n * tp_size for n in self._qkv_split], has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearReplicated(
-            self.qo_attn_dim, config.hidden_size, has_bias=False,
+        self.o_proj = LinearRowParallel(
+            config.num_qo_heads * self.head_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
         )
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -148,22 +152,36 @@ class Qwen4ExpAttention(BaseOP):
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
-        qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
-        qg = qg.view(-1, self.num_q, self.head_dim * 2)
+        full_q_dim = self.qo_attn_dim * self._tp_size
+        full_kv_dim = self.kv_attn_dim * self._tp_size
+        projected = self.qkv_proj.forward_full(x) if self._tp_size > 1 else self.qkv_proj.forward(x)
+        qg, k, v = projected.split([full_q_dim * 2, full_kv_dim, full_kv_dim], dim=-1)
+        qg = qg.view(-1, self.num_q * self._tp_size, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
-        k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+        gate = qg[..., self.head_dim :].reshape(-1, full_q_dim)
+        k = k.contiguous().view(-1, self.num_kv * self._tp_size, self.head_dim)
         v = v.contiguous()
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
         q, k = self.rotary.forward(
-            batch.get_attn_positions(), q.view(-1, self.qo_attn_dim), k.view(-1, self.kv_attn_dim)
+            batch.get_attn_positions(), q.view(-1, full_q_dim), k.view(-1, full_kv_dim)
         )
+        if self._tp_size > 1:
+            # BF16 normalization/rotation ties depend on launch shape; slice heads afterwards.
+            def local_heads(value, heads):
+                return value.reshape(-1, heads * self._tp_size, self.head_dim)[
+                    :, self._tp_rank * heads:(self._tp_rank + 1) * heads
+                ].reshape(-1, heads * self.head_dim).contiguous()
+
+            q = local_heads(q, self.num_q)
+            k = local_heads(k, self.num_kv)
+            v = local_heads(v, self.num_kv)
+            gate = local_heads(torch.sigmoid(gate), self.num_q)
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )
-        gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
+        gated = o.reshape(-1, self.qo_attn_dim) * (gate if self._tp_size > 1 else torch.sigmoid(gate))
         return self.o_proj.forward(gated)
 
 

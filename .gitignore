@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+python/freetoken/native/runtime/
 *.py[codz]
 *$py.class
 
@@ -227,3 +228,7 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# Keep graph-builder sources visible despite the generic build/ rule.
+!python/freetoken/kernel/csrc/radiance_native/core/build/
+!python/freetoken/kernel/csrc/radiance_native/core/build/**

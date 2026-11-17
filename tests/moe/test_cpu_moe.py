@@ -117,7 +117,8 @@ _NVFP4_TIERS = {"scalar": "scalar", "avx2": "avx2", "avx512": "avx512f"}
 
 @pytest.mark.parametrize("isa", list(_NVFP4_TIERS))
 @pytest.mark.parametrize("bs", [1, 3, 8])
-def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs, isa, monkeypatch):
+@pytest.mark.parametrize("intermediate", [752, 320])
+def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs, isa, monkeypatch, intermediate):
     """CPU NVFP4 GEMV vs. canonical dequant_nvfp4 + bf16 GPU decode, per ISA tier.
 
     Both paths read byte-identical quantized banks. The avx2 / avx512 tiers run W4A8 when the CPU has their VNNI, and the int8 activation rounding dominates the spread; the fp32 dots differ only by weight bf16-rounding + reduction order.
@@ -127,7 +128,8 @@ def test_cpu_decode_nvfp4_matches_dequant_then_gpu(bs, isa, monkeypatch):
     from freetoken.moe.fused import fused_experts_decode_impl
 
     torch.manual_seed(100 + bs)
-    L, E, H, I, top_k = 3, 16, 1024, 752, 4  # 47 blocks of 16: the W4A8 down dots run their partial-chunk and scalar tails
+    # 752 covers odd tails; 320 is a Qwen3.8 TP2 shard with a four-block W4A8 tail.
+    L, E, H, I, top_k = 3, 16, 1024, intermediate, 4
     layer = 1
     dev = torch.device("cuda")
     cache = _make_nvfp4_cache(L, E, H, I)

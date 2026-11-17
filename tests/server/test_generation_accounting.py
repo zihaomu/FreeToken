@@ -28,6 +28,20 @@ from freetoken.server.generation import (  # noqa: E402
 )
 
 
+def test_native_snapshot_does_not_become_torch_reserved_memory():
+    from freetoken.server.stats import StatsTracker
+
+    tracker = StatsTracker()
+    snapshot = {"memory_kind": "native owned", "ranks": [{"native_committed_bytes": 12345}]}
+    tracker.on_new_user(1)
+    tracker.observe(UserReply(uid=1, incremental_output="hello", finished=True,
+                              completion_tokens_delta=2, native_stats=snapshot))
+    assert tracker.native_stats == snapshot
+    assert tracker.vram_bytes == 0
+    assert tracker.completion_tokens_total == 2
+    assert tracker.active == 0
+
+
 @pytest.fixture(autouse=True)
 def served_model_name():
     """_record_generation stamps the row from api_server._served_model_name(), which reads the

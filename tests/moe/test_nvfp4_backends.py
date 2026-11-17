@@ -560,7 +560,8 @@ def test_triton_decode_marlin_matches_dequant_reference_after_prefill_stomp():
 
 
 @cuda
-def test_triton_decode_marlin_matches_baseline_kernel():
+@pytest.mark.parametrize("inactive_routes", [0, 1, TOPK])
+def test_triton_decode_marlin_matches_baseline_kernel(inactive_routes):
     """The production marlin-style decode GEMV must match the original LUT-gather decode
     within tolerance (it only reorders the dequant math: int32 wide load + deferred reduce)."""
     from freetoken.moe.fused_nvfp4 import (
@@ -569,17 +570,24 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     )
 
     device = torch.device("cuda")
-    cache, _ = _triton_cache(device)
+    cache, ref_sources = _triton_cache(device)
     torch.manual_seed(11)
     hidden = torch.randn(1, H, dtype=torch.bfloat16, device=device) / 4
     topk_weights = torch.rand(1, TOPK, dtype=torch.float32, device=device)
     ids = torch.tensor([[1, 6]], dtype=torch.int32, device=device)
+    ref_weights = topk_weights.clone()
+    ref_weights[:, :inactive_routes] = 0
+    ref = _ref_moe(ref_sources, 0, hidden, ref_weights, ids)
     cache.ensure_experts(0, ids)
     cache.copy_missing()
+    ids[:, :inactive_routes] = -1
     banks = cache.pool_bank_views(0)
     marlin = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids, "silu", False)
     base = fused_experts_decode_nvfp4_serial(hidden, *banks, topk_weights, ids, "silu", False)
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
+    _assert_close(marlin, ref)
+    if inactive_routes == TOPK:
+        assert torch.count_nonzero(marlin) == 0
 
 
 @cuda

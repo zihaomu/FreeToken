@@ -52,6 +52,7 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # Scheduler-measured per-request timings (ReqStats.finish) on the terminal reply
     # only; None on intermediate replies, errors and aborts.
     timings: dict | None = None
+    native_stats: dict | None = None
 
 
 @dataclass

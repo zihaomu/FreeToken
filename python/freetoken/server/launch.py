@@ -7,9 +7,6 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from freetoken.distributed import DistributedInfo
-from freetoken.utils import init_logger
-
 if TYPE_CHECKING:
     from .args import ServerArgs
     from .supervisor import BackendHandle
@@ -115,6 +112,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         try:
             scheduler.run_forever()
         except KeyboardInterrupt:
+            from freetoken.utils import init_logger
+
             logger = init_logger(__name__)
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
@@ -127,8 +126,29 @@ def launch_server(
     argv: list[str] | None = None,
     prog: str | None = None,
 ) -> None:
+    import argparse
+
+    actual_argv = sys.argv[1:] if argv is None else argv
+    backend_parser = argparse.ArgumentParser(add_help=False)
+    backend_parser.add_argument("--execution-backend", default="torch")
+    backend, _ = backend_parser.parse_known_args(actual_argv)
+    if backend.execution_backend == "radiance-native":
+        visibility = os.environ.get("HIP_VISIBLE_DEVICES", "")
+        expected_pcis = os.environ.get("FREETOKEN_NATIVE_EXPECTED_PCIS", "[]")
+        os.environ["HIP_VISIBLE_DEVICES"] = "-1"
+        os.environ["ROCR_VISIBLE_DEVICES"] = "-1"
+        from .native import launch_native
+
+        launch_native(actual_argv, run_shell=run_shell, prog=prog,
+                      visibility=visibility, expected_pcis=expected_pcis)
+        return
+    if backend.execution_backend != "torch":
+        raise SystemExit(f"unknown execution backend: {backend.execution_backend}")
+
     from .api_server import run_api_server
     from .args import parse_args
+    from freetoken.distributed import DistributedInfo
+    from freetoken.utils import init_logger
 
     server_args, run_shell = parse_args(
         sys.argv[1:] if argv is None else argv,

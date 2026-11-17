@@ -15,6 +15,45 @@ from freetoken.layers import gated_act_and_mul
 from freetoken.moe.fused import moe_align_block_size
 
 
+def fused_experts_nvfp4_tp2(x, gate_up, gate_scale, gate_global, down, down_scale, down_global,
+                           weights, ids, num_experts, activation, apply_router_weight_on_input,
+                           alpha, limit, *, is_prefill):
+    """Partition gate/up rows and down output rows, retaining the full down K reduction."""
+    from freetoken.distributed import DistributedCommunicator
+
+    comm = DistributedCommunicator()
+
+    def gather_columns(value):
+        parts = comm.all_gather(value.contiguous()).view(2, *value.shape)
+        return torch.cat(list(parts.unbind(0)), dim=-1).contiguous()
+
+    m, h = x.shape
+    k, two_i = ids.shape[1], gate_up.shape[1]
+    gu = torch.empty((m, k, two_i), device=x.device, dtype=x.dtype)
+    act = torch.empty((m * k, two_i // 2), device=x.device, dtype=x.dtype)
+    routes = torch.empty((m, k, h // 2), device=x.device, dtype=x.dtype)
+    if is_prefill:
+        cfg = nvfp4_moe.prefill_config(m, k, num_experts, x.device.index)
+        sort, experts, ntpp = moe_align_block_size(ids, cfg["BLOCK_SIZE_M"], num_experts)
+        tw = weights.reshape(-1).contiguous()
+        nvfp4_moe.prefill_gemm(x, gate_up, gate_scale, gate_global, gu, tw, sort, experts, ntpp,
+                              ids.numel(), k, apply_router_weight_on_input, cfg)
+    else:
+        nvfp4_moe.decode_gemm_marlin(x, gate_up, gate_scale, gate_global, gu, weights, ids,
+                                   apply_router_weight_on_input, False)
+    gated_act_and_mul(activation, gu.view(-1, two_i), act, alpha=alpha, limit=limit)
+    full_act = gather_columns(act)
+    if is_prefill:
+        nvfp4_moe.prefill_gemm(full_act, down, down_scale, down_global, routes, tw, sort, experts, ntpp,
+                              ids.numel(), 1, not apply_router_weight_on_input, cfg)
+    else:
+        nvfp4_moe.decode_gemm_marlin(full_act, down, down_scale, down_global, routes, weights, ids,
+                                   not apply_router_weight_on_input, True)
+    local = torch.empty((m, h // 2), device=x.device, dtype=x.dtype)
+    moe_sum_reduce_triton(routes, local)
+    return gather_columns(local)
+
+
 def _fused_experts_decode_nvfp4(
     gemm_fn,
     hidden_states: torch.Tensor,

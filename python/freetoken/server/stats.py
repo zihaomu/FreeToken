@@ -37,6 +37,7 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        self.native_stats: dict | None = None
 
     @property
     def active(self) -> int:
@@ -74,6 +75,8 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        if getattr(reply, "native_stats", None) is not None:
+            self.native_stats = reply.native_stats
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:

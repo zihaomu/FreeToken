@@ -181,6 +181,7 @@ class FrontendManager:
     # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
     # (the running snapshot channel) has anything. None until meta arrives.
     cache_pools: Dict[str, int] | None = None
+    native_backend_meta: Dict[str, Any] | None = None
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
@@ -317,6 +318,14 @@ class FrontendManager:
         result = {"status": "failed", "error": message}
 
         def _resolve_all() -> None:
+            if getattr(getattr(self, "config", None), "native_config", None) is not None:
+                # The native IPC producer is gone; no terminal token reply can arrive.
+                for uid, event in list(self.event_map.items()):
+                    self.ack_map.setdefault(uid, []).append(UserReply(
+                        uid=uid, incremental_output="", finished=True, error=message,
+                        error_code="backend_unavailable",
+                    ))
+                    event.set()
             for request_id in list(self.rebuild_futures):
                 fut = self.rebuild_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
@@ -415,6 +424,9 @@ async def lifespan(_: FastAPI):
     global _GLOBAL_STATE
     if _GLOBAL_STATE is not None:
         _GLOBAL_STATE.shutdown()
+        if getattr(_GLOBAL_STATE.config, "native_config", None) is not None:
+            # The adapter owns a native child. Let it drain before uvicorn re-raises SIGTERM.
+            await asyncio.to_thread(_reap_backend_workers, _GLOBAL_STATE.backend_processes, 35.0)
 
 
 def install_cors(app: FastAPI, origins_csv: str) -> None:
@@ -887,6 +899,10 @@ def cache_geometry(state: Any) -> dict:
         "cache_budget_bytes": int(getattr(state, "cache_budget_bytes", 0) or 0),
         "reasoning": reasoning,
     }
+    if getattr(state, "native_backend_meta", None) is not None:
+        geo["execution_backend"] = "radiance-native"
+        geo["native"] = state.native_backend_meta
+        geo["native_snapshot"] = getattr(tr, "native_stats", None)
     # Per-pool slider bounds, sized against the cache budget the rebuild fit-check actually
     # enforces — NOT the raw post-weights free VRAM, which is larger by the (1-memory_ratio)
     # graph/activation headroom and would offer slider room every rebuild rejects. Both come
@@ -1102,6 +1118,8 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # (unit_bytes + the limits block + the pre-first-chat pool seed). Unpack the extras
         # aside so unit_bytes keeps its original three-key shape; unknown keys, if any, are inert.
         meta = dict(meta or {})
+        _GLOBAL_STATE.native_backend_meta = meta.pop("native", None)
+        meta.pop("execution_backend", None)
         _GLOBAL_STATE.free_vram_bytes = int(meta.pop("free_vram_bytes", 0) or 0)
         _GLOBAL_STATE.cache_floors = meta.pop("floors", None)
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
@@ -1132,4 +1150,5 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _serve_and_run_shell(host, port, config.api_key)
         return
     # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    # A failed TP rank cannot finish in-flight streams; bound draining before worker teardown.
+    uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=15 if config.tp_info.size > 1 else None)

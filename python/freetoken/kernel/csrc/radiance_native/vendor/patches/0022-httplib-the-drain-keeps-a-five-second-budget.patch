@@ -1,0 +1,22 @@
+diff --git a/httplib.cpp b/httplib.cpp
+index ebe01d1..e5efe4d 100644
+--- a/httplib.cpp
++++ b/httplib.cpp
+@@ -10585,7 +10585,16 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
+   // arrive within the read timeout.
+   if (!req.body_consumed_ && detail::has_framed_body(req) &&
+       !detail::has_header_token(res.headers, "Connection", "close")) {
+-    strm.set_max_timeout(read_timeout_msec);
++    // LOCAL CHANGE (radiance): the drain's budget is the lesser of five
++    // seconds and the connection's read timeout. read_timeout_msec bounds a
++    // whole request's reads -- uploads included -- so it cannot itself be
++    // lowered to hurry a drain along; without its own budget, a client
++    // dribbling one byte per gap paces this worker for the connection's
++    // full timeout after the response was already sent.
++    constexpr int kDrainBudgetMsec = 5000;
++    strm.set_max_timeout(read_timeout_msec < kDrainBudgetMsec
++                             ? read_timeout_msec
++                             : kDrainBudgetMsec);
+     int dummy_status;
+     if (req.body_read_started_ ||
+         !detail::read_content(

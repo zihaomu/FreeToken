@@ -478,8 +478,8 @@ class Engine:
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
-        free_min, free_max = self._sync_get_memory()
-        init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        free_min, _ = self._sync_get_memory()
+        init_free_memory = free_min
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -547,7 +547,7 @@ class Engine:
             )
 
         # ======================= KV cache initialization ========================
-        new_free = self._sync_get_memory()[1]
+        new_free = self._sync_get_memory()[0]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
@@ -658,6 +658,11 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+            if torch.version.hip and config.tp_info.size == 2 and config.model_config.qwen4_args is not None:
+                # Initialize RCCL before offload allocation and include its buffers in the cache budget.
+                warmup = torch.ones((1, config.model_config.hidden_size), device=self.device, dtype=self.dtype)
+                torch.distributed.all_reduce(warmup)
+                torch.cuda.synchronize(self.device)
         return tp_cpu_group
 
     def _load_weights(self, config: EngineConfig) -> None:

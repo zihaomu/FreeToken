@@ -290,6 +290,8 @@ def parse_args(
         return None
 
     parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")
+    parser.add_argument("--execution-backend", choices=["torch", "radiance-native"], default="torch",
+                        help="radiance-native uses its own early configuration path; see its --help")
 
     parser.add_argument(
         "--model-path",
@@ -710,6 +712,26 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--scheduler-stream",
+        choices=["separate", "shared"],
+        default=ServerArgs.scheduler_stream,
+        help=(
+            "GPU stream for scheduler metadata operations. 'shared' uses the engine stream while retaining "
+            "the CPU result pipeline and MoE prefill overlap; 'separate' (default) uses a dedicated stream."
+        ),
+    )
+
+    parser.add_argument(
+        "--ple-prefetch",
+        choices=["all", "prefill", "none"],
+        default=ServerArgs.ple_prefetch,
+        help=(
+            "Side-stream gather policy for --ple-backend pinned. 'prefill' gathers decode rows on the "
+            "engine stream while retaining prefill prefetch; 'none' disables the side stream."
+        ),
+    )
+
+    parser.add_argument(
         "--embed-weights",
         default=ServerArgs.embed_weights,
         choices=["gpu", "host"],
@@ -977,6 +999,7 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    kwargs.pop("execution_backend")
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

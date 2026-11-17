@@ -23,6 +23,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from freetoken.server.api_server import FrontendManager, dispatch_rebuild
@@ -146,7 +147,8 @@ def test_late_reply_cannot_resurrect_a_fatal_latch():
     asyncio.run(_run())
 
 
-def test_crash_during_rebuild_latches_failed_via_watchdog():
+@pytest.mark.parametrize("native", [False, True])
+def test_crash_during_rebuild_latches_failed_via_watchdog(native):
     """Scheduler-crash path, end to end and cross-thread: a worker dies while a rebuild is in
     flight ("rebuilding"). No reply ever arrives, but the liveness watchdog (on its own thread)
     fires on_failure, which mirrors production _on_failure — it (a) drives the gate to a definite
@@ -172,6 +174,9 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
             return None  # enqueue succeeds; the backend then crashes without ever replying
 
         state = _FakeState(ok, maintenance_state="serving")
+        state.config = SimpleNamespace(native_config=object() if native else None)
+        state.event_map = {7: asyncio.Event()}
+        state.ack_map = {7: []}
         state._loop = asyncio.get_running_loop()
         ready_evt = threading.Event()
 
@@ -219,6 +224,13 @@ def test_crash_during_rebuild_latches_failed_via_watchdog():
         assert state.rebuild_futures == {}          # waiter resolved and cleared, not leaked
         assert (await asyncio.wait_for(flush_fut, timeout=5.0)).status == "failed"
         assert state.flush_futures == {}
+        assert state.event_map[7].is_set() is native
+        if native:
+            reply, = state.ack_map[7]
+            assert reply.finished and reply.error_code == "backend_unavailable"
+            assert "scheduler" in reply.error
+        else:
+            assert state.ack_map[7] == []
         sup.join(timeout=1.0)
 
     asyncio.run(_run())

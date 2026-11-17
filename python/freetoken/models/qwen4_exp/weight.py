@@ -206,6 +206,13 @@ class _DenseReader:
         part = {role: 1.0 / t.to(torch.float32) if storage[role].reciprocal else t for role, t in part.items()}
         weight = part["weight"]
         rows, cols = weight.shape[0], weight.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
+        if get_tp_info().size > 1:
+            from .tp import supports_tp_row_fp8
+
+            if supports_tp_row_fp8(module, scheme):
+                scale = part["weight_scale"]
+                if scale.numel() != rows or not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
+                    raise ValueError(f"{module}: TP2 row-FP8 requires one finite positive scale per output row")
         block_rows, block_cols = scheme.weight.group or (1, 1)
         scale_role = "weight_scale_inv" if "weight_scale_inv" in part else "weight_scale"
         out = dict(part)
@@ -248,6 +255,40 @@ class _DenseReader:
         return out
 
 
+def _tp_shard_dense(name: str, tensor: torch.Tensor, text, rank: int, size: int,
+                    *, pad_vocab: bool = False) -> torch.Tensor:
+    if size == 1:
+        return tensor
+
+    def part(t, axis=0):
+        if t.shape[axis] % size:
+            raise ValueError(f"{name}: dimension {t.shape[axis]} is not divisible by TP={size}")
+        return t.chunk(size, dim=axis)[rank].contiguous()
+
+    if name in ("model.embed_tokens.weight", "lm_head.weight", "lm_head.weight_scale"):
+        from freetoken.utils import div_ceil
+
+        rows = div_ceil(tensor.shape[0], size)
+        shard = tensor[rank * rows : (rank + 1) * rows].contiguous()
+        if pad_vocab and shard.shape[0] < rows:
+            fill = 1 if name.endswith("weight_scale") else 0
+            padding = torch.full((rows - shard.shape[0], *tensor.shape[1:]), fill,
+                                 dtype=tensor.dtype, device=tensor.device)
+            shard = torch.cat((shard, padding), dim=0)
+        elif pad_vocab:
+            # A contiguous row view still retains the full-vocab GPU allocation.
+            shard = shard.clone()
+        return shard
+    if re.fullmatch(r"model\.layers\.\d+\.linear_attn\.conv1d\.weight", name):
+        kd = int(text.linear_num_key_heads) * int(text.linear_key_head_dim)
+        vd = int(text.linear_num_value_heads) * int(text.linear_value_head_dim)
+        # Q/K/V are separate head groups even inside one checkpoint tensor.
+        return torch.cat([part(t) for t in tensor.split([kd, kd, vd], dim=0)], dim=0)
+    if re.fullmatch(r"model\.layers\.\d+\.linear_attn\.(A_log|dt_bias)", name):
+        return part(tensor)
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -263,32 +304,59 @@ def iter_weights(
     Fusions, per role: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
+    tp = get_tp_info()
+    from .tp import require_tp_row_fp8
+
+    if tp.size not in (1, 2):
+        raise NotImplementedError("qwen4_exp supports TP=1 or TP=2")
+    if tp.size > 1 and include_vision:
+        raise NotImplementedError("qwen4_exp TP=2 requires text-only loading")
     if not include_non_moe:
         return
 
     hf_config = cached_load_hf_config(model_path)
     spec = get_model_spec(hf_config.architectures[0])
     reader = _DenseReader(get_quant_config(), spec.packed_modules_mapping)
+    text = getattr(hf_config, "text_config", hf_config)
+    folder = download_hf_weight(model_path)
+    index_path = os.path.join(folder, "model.safetensors.index.json")
+    weight_map = None
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as index_file:
+            weight_map = json.load(index_file)["weight_map"]
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
         disable=not get_tp_info().is_primary(),
     ):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+        with safetensors.safe_open(file, framework="pt", device="cpu" if tp.size > 1 else str(device)) as f:
             for raw_name in f.keys():
+                # A derived checkpoint may share old shards and remap selected tensors.
+                if weight_map is not None and os.path.normpath(weight_map.get(raw_name, "")) != os.path.relpath(file, folder):
+                    continue
                 name = _rename(raw_name)
                 if name is None:
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
+                module = name.rpartition(".")[0]
+                scheme = reader.scheme(module)
+                if tp.size > 1 and scheme is not None:
+                    require_tp_row_fp8(module, scheme)
+                quant_head = tp.size > 1 and module == "lm_head" and scheme is not None
                 tensor = f.get_tensor(raw_name)
+                # Validate and normalize full-vocab weight/scale together before slicing either.
+                if not quant_head:
+                    tensor = _tp_shard_dense(name, tensor, text, tp.rank, tp.size)
+                tensor = tensor.to(device)
                 emitted = None if name.startswith(VISION_KEY_PREFIXES) else reader.add(name, tensor)
                 if emitted is None:
                     yield name, tensor
                 else:
-                    yield from emitted
+                    for key, value in emitted:
+                        if quant_head:
+                            value = _tp_shard_dense(key, value, text, tp.rank, tp.size, pad_vocab=True)
+                        yield key, value
 
     if reader.pending:
         lines = reader.missing()

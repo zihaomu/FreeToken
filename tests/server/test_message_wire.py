@@ -28,6 +28,67 @@ from freetoken.message import (
 from freetoken.core import SamplingParams
 
 
+@pytest.mark.parametrize("count", [0, 1, 4])
+@pytest.mark.parametrize("terminal", [False, True])
+def test_native_committed_tokens_keep_epoch_and_binary_ids(count, terminal):
+    import socket
+    import struct
+    from freetoken.native.protocol import Kind, decode_tokens, recv_frame, send_frame
+
+    left, right = socket.socketpair()
+    try:
+        tokens = [0, 248044, 248319, 42][:count]
+        payload = struct.pack("<QI", 123456789, count) + struct.pack(f"<{count}i", *tokens)
+        kind = Kind.FINAL_TOKENS if terminal else Kind.TOKENS
+        send_frame(left, kind, 77, 3, payload)
+        kind, uid, epoch, actual = recv_frame(right)
+        assert (kind, uid, epoch) == (Kind.FINAL_TOKENS if terminal else Kind.TOKENS, 77, 3)
+        assert decode_tokens(actual) == (123456789, tokens)
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("field,value", [(0, 0), (1, 65535), (2, 65535), (3, 8 * 1024 * 1024 + 1), (4, 1)])
+def test_native_rejects_incompatible_or_unbounded_header(field, value):
+    import socket
+    from freetoken.native.protocol import HEADER, MAGIC, VERSION, Kind, recv_frame
+
+    fields = [MAGIC, VERSION, Kind.TOKENS, 0, 0, 1, 1]
+    fields[field] = value
+    left, right = socket.socketpair()
+    try:
+        left.sendall(HEADER.pack(*fields))
+        with pytest.raises(ValueError):
+            recv_frame(right)
+    finally:
+        left.close()
+        right.close()
+
+
+def test_native_partial_header_eof_fails_instead_of_waiting_for_worker():
+    import socket
+    from freetoken.native.protocol import recv_frame
+
+    left, right = socket.socketpair()
+    try:
+        left.sendall(b"FTNW\x01")
+        left.shutdown(socket.SHUT_WR)
+        with pytest.raises(EOFError):
+            recv_frame(right)
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("payload", [b"", b"0" * 11, b"\0" * 12 + b"1234"])
+def test_native_rejects_malformed_committed_token_count(payload):
+    from freetoken.native.protocol import decode_tokens
+
+    with pytest.raises(ValueError):
+        decode_tokens(payload)
+
+
 def test_inline_system_policy_tokenizer_roundtrip():
     for policy in (None, "auto", "preserve", "fold"):
         msg = TokenizeMsg(uid=1, text=[{"role": "system", "content": "instruction"}],
@@ -88,6 +149,7 @@ def test_user_reply_token_deltas_round_trip():
         kv_used_pages=40,
         kv_total_pages=512,
         gpu_mem_bytes=64 * (1 << 30),
+        native_stats={"memory_kind": "native owned", "ranks": [{"native_committed_bytes": 12345}]},
     )
 
     decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
@@ -102,6 +164,7 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512
     assert decoded.gpu_mem_bytes == 64 * (1 << 30)
+    assert decoded.native_stats == msg.native_stats
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
@@ -110,12 +173,14 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
+        native_stats={"memory_kind": "native owned", "ranks": [{"native_committed_bytes": 12345}]},
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+    assert decoded.native_stats == msg.native_stats
 
 
 def test_terminal_replies_carry_scheduler_timings_over_the_wire():

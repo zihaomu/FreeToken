@@ -89,7 +89,7 @@ class MoELayer(BaseOP):
         self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.quant_method.kernel.output_replicated:
             return self._comm.all_reduce(hidden_states)
         return hidden_states
 

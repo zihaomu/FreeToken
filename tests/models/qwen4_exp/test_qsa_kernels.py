@@ -501,3 +501,27 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 4, 16, 128, 256, 512, 2048])
+def test_tp_head_shards_preserve_full_attention_split_schedule(rows):
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+    torch.manual_seed(17)
+    q = torch.randn(rows, 24, 256, device="cuda", dtype=torch.bfloat16) * .5
+    k = torch.randn(8, 64, 2, 256, device="cuda", dtype=torch.bfloat16) * .5
+    v = torch.randn_like(k)
+    indices = torch.full((rows, 2048), -1, device="cuda", dtype=torch.int32)
+    indices[:, :512] = torch.arange(512, device="cuda", dtype=torch.int32)
+    pages = torch.arange(8, device="cuda", dtype=torch.int32).unsqueeze(0)
+    req = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    reference = qsa_sparse_paged_attention(q, k, v, indices, pages, req)
+    parts = [
+        qsa_sparse_paged_attention(q[:, rank * 12:(rank + 1) * 12].contiguous(),
+                                   k[:, :, rank:rank + 1].contiguous(),
+                                   v[:, :, rank:rank + 1].contiguous(),
+                                   indices, pages, req, profile_kv_heads=2)
+        for rank in (0, 1)
+    ]
+    assert torch.equal(torch.cat(parts, dim=1), reference)

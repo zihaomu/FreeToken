@@ -232,6 +232,8 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    *,
+    profile_kv_heads: int | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches."""
 
@@ -261,7 +263,8 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
-    base_programs = q.shape[0] * k_cache.shape[2]
+    # TP must retain the same softmax partitioning as the full-head reference.
+    base_programs = q.shape[0] * (profile_kv_heads if profile_kv_heads is not None else k_cache.shape[2])
     small_profile_limit = 8 if block_m <= 8 else 4
 
     # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.

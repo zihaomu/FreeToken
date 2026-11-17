@@ -144,6 +144,8 @@ class MoEKernel(ABC):
     # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
     # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
     supports_inactive_slots: ClassVar[bool] = False
+    # Some TP layouts gather disjoint output rows instead of returning partial sums.
+    output_replicated: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

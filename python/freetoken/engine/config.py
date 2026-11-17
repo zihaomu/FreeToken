@@ -34,6 +34,7 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    ple_prefetch: str = "all"
     # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
     embed_weights: str = "gpu"
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
@@ -118,6 +119,8 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.ple_prefetch not in ("all", "prefill", "none"):
+            raise ValueError("ple_prefetch must be 'all', 'prefill' or 'none'")
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
         if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:
@@ -168,6 +171,23 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        if model_config.qwen4_args is not None and self.tp_info.size > 1:
+            from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+            if self.tp_info.size != 2:
+                raise NotImplementedError("qwen4_exp supports TP=1 or TP=2")
+            if self.active_encoders:
+                raise NotImplementedError("qwen4_exp TP=2 requires --text-model-only")
+            if is_ftw_checkpoint(self.model_path):
+                raise NotImplementedError("qwen4_exp TP=2 requires the original safetensors checkpoint; FTW banks are not TP-sharded")
+            if self.ple_backend != "disk":
+                raise NotImplementedError("qwen4_exp TP=2 currently requires --ple-backend disk")
+            if self.speculative_algorithm is not None:
+                raise NotImplementedError("qwen4_exp TP=2 speculative decoding is not supported")
+            if self.moe_strategy != "offload" or self.moe_cpu_layers:
+                raise NotImplementedError("qwen4_exp TP=2 currently requires GPU offload without CPU layers")
+            if self.dtype != torch.bfloat16 or self.use_pynccl:
+                raise NotImplementedError("qwen4_exp TP=2 currently requires --dtype bfloat16 --disable-pynccl")
         return replace(model_config, quant=quant)
 
     @property

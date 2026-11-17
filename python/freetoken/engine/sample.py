@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
+from freetoken.distributed import DistributedCommunicator, try_get_tp_info
 from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -116,6 +117,10 @@ class Sampler:
                     # greedy rows must follow argmax's deterministic tie-breaking.
                     greedy_tokens = torch.argmax(logits, dim=-1).to(tokens.dtype)
                     tokens = torch.where(args.greedy_mask, greedy_tokens, tokens)
+            tp = try_get_tp_info()
+            if tp is not None and tp.size > 1:
+                # Rank-local kernels may consume different RNG histories; commit rank 0's token everywhere.
+                tokens = DistributedCommunicator().all_gather(tokens).view(tp.size, *tokens.shape)[0].contiguous()
             # Update on the sampling stream: overlapped scheduling can prepare the next
             # batch before the previous token reaches Req.input_ids on the CPU.
             for row, counts, _, _ in args.penalties:
