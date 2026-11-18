@@ -23,7 +23,7 @@
 #include "sample/gbnf.h"
 #include "sample/grammar.h"
 #include "sample/sampler.h"
-#include "sched/scheduler.h"
+#include "runtime/batch_state.h"
 #include "rad_builder.h"
 #include "text/chat.h"
 #include "text/chatfmt.h"
@@ -169,7 +169,7 @@ public:
      * `tiers` is rank 0's IdleTiers, passed even when no tier can move anything: it holds the
      * session table either way (without --prefix-cache-mib every session is in VRAM). Null only
      * with no engine. */
-    explicit SchedulerBridge(Scheduler* s, const Sampler* sampler = nullptr,
+    explicit SchedulerBridge(BatchState* s, const Sampler* sampler = nullptr,
                              const IdleTiers* tiers = nullptr)
         : s_(s), sampler_(sampler), tiers_(tiers) {}
 
@@ -289,12 +289,12 @@ public:
     /* The state name is derived: ReqState has no `Prefill`, since to the scheduler prefill is a
      * running request whose prompt is not yet all in the KV. The table reports it separately. */
     int requests(std::vector<RequestStat>* out) const override {
-        std::vector<Scheduler::ReqStat> raw(256);
+        std::vector<BatchState::ReqStat> raw(256);
         const int n = s_->observed_requests(raw.data(), (int)raw.size());
         out->clear();
         out->reserve((size_t)n);
         for (int i = 0; i < n; ++i) {
-            const Scheduler::ReqStat& r = raw[(size_t)i];
+            const BatchState::ReqStat& r = raw[(size_t)i];
             RequestStat o;
             o.id = r.id;
             switch ((ReqState)r.state) {
@@ -332,7 +332,7 @@ public:
 
 private:
     /* Declared in the constructor's initialiser order (-Wreorder). */
-    Scheduler*            s_;
+    BatchState*           s_;
     const Sampler*        sampler_ = nullptr;
     const IdleTiers*      tiers_ = nullptr;
     /* Ids start at 1: zero is the "no request" value the sink and the metrics use. */

@@ -110,7 +110,7 @@ struct Active {
     bool stopping = false;
 };
 
-int run(int fd, rad::Scheduler& sched, std::shared_ptr<const rad::Vocab> vocab, const Json& facts,
+int run(int fd, rad::BatchState& sched, std::shared_ptr<const rad::Vocab> vocab, const Json& facts,
         const std::function<Json()>& snapshot) {
     std::unique_ptr<Active> active;
     uint64_t next_id = 1;
@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
         rad::Engine engine(std::move(cfg));
         const int started = engine.start();
         if (started < 0) throw std::runtime_error("native model start failed: " + std::to_string(started));
-        const int rc = engine.serve_headless([&](rad::Scheduler& sched,
+        const int rc = engine.serve_headless([&](rad::BatchState& sched,
                           std::shared_ptr<const rad::Vocab> vocab, const Json& facts) {
             return ft_native::run(fd, sched, std::move(vocab), facts, [&] { return engine.headless_stats(); });
         });

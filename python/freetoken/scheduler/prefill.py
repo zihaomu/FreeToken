@@ -11,6 +11,7 @@ from freetoken.utils import align_down, div_ceil, init_logger
 
 from .mm import mm_chunk_end, mm_rows_after
 from .utils import PendingReq
+from .core import additional_page_tokens, prefill_chunk_size
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
@@ -65,10 +66,7 @@ class PrefillAdder:
 
     def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
         """Return the token-equivalent cost of the additional KV pages for a request."""
-        page_size = self.cache_manager.page_size
-        return (
-            div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
-        ) * page_size
+        return additional_page_tokens(total_len, cached_len, self.cache_manager.page_size)
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -179,12 +177,7 @@ class PrefillAdder:
                     return None
                 chunk_size = aligned
         align = self.cache_manager.prefill_chunk_align
-        if align > 1 and 0 < chunk_size < remain_len:
-            # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
-            # so keep it when the leftover budget cannot fill one whole unit instead of stalling
-            # the request until it gets a bigger turn.
-            aligned = align_down(cached_len + chunk_size, align) - cached_len
-            chunk_size = aligned if aligned > 0 else chunk_size
+        chunk_size = prefill_chunk_size(cached_len, remain_len, chunk_size, align)
         if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
             # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
             unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)

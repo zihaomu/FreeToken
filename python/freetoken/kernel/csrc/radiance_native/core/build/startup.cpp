@@ -246,7 +246,7 @@ static int pick_arch(Registry& r, const std::string& home, const std::string& ar
 
 int rad_tools_load_plugins(const std::string& home, const std::vector<std::string>& hierarchy,
                            const std::string& arch_id, const std::string& quant,
-                           LoadedPlugins* out, bool imported) {
+                           LoadedPlugins* out, bool imported, bool architectures) {
     if (!out) return RAD_E_INVAL;
     *out = LoadedPlugins{};
 
@@ -278,10 +278,13 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
     int s = r.load_dirs(kdirs, hierarchy);
     if (s < 0) return s;
 
+    if (architectures) {
     std::vector<std::string> adirs = home_subdirs(home, "architectures");
     if (adirs.empty()) adirs.push_back(first + "/architectures");
     s = r.load_dirs(adirs, {});
     if (s < 0) return s;
+
+    }
 
     /* Quantisers: rad-convert drives them, and the oracle decodes through them for schemes the
      * core does not define. Optional. */
@@ -313,6 +316,7 @@ int rad_tools_probe(const LoadedPlugins& lp, const RadModelMeta& meta, RadArchPr
     *out = RadArchProbe{};
     out->gen_max_pixels = gen_max_pixels;
     out->gen_max_refs = gen_max_refs;
+    if (lp.lowerer) return lp.lowerer->probe(&meta, out);
     const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
     if (!ap || !ap->arch_probe) return RAD_E_UNSUPPORTED;
     const int s = ap->arch_probe(&meta, out);
@@ -464,20 +468,25 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
 
     Registry& r = lp.registry ? *lp.registry : rad_tools_registry();
     const Plugin* ap = r.plugin(lp.arch_plugin);
-    if (!ap || !ap->arch_declare) {
+    if (!lp.lowerer && (!ap || !ap->arch_declare)) {
         RAD_ERR("architecture plugin '%s' is not loaded or exports no rad_arch_declare",
                 lp.arch_plugin.c_str());
         return RAD_E_NOTFOUND;
     }
 
     Builder b(r, meta, ctx);
+    if (lp.lowerer && lp.lowerer->state_layout)
+        b.set_state_layout([&](const char* name, RadKVGroupDecl* d) {
+            return lp.lowerer->state_layout(ctx.rank, name, d);
+        });
     if (ref) b.set_reference(ref);
     if (sources) b.set_sources(sources);
     b.set_instances(instances);
     const bool with_lora = lora && lora->cfg && lora->cfg->enabled();
     if (with_lora) b.set_lora_targets(&lora->targets);
 
-    int s = ap->arch_declare(&b, &meta, &ctx);
+    int s = lp.lowerer ? lp.lowerer->declare(&b, &meta, &ctx) :
+                         ap->arch_declare(&b, &meta, &ctx);
     if (s < 0) {
         RAD_ERR("%s: rad_arch_declare returned %s", lp.arch_plugin.c_str(), rad_strerror(s));
         for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
@@ -523,6 +532,10 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     if (s < 0) return s;
     if (b.status() < 0) return b.status();
 
+    if (lp.lowerer && lp.lowerer->validate) {
+        const int verified = lp.lowerer->validate(b.program(), ctx.rank,ctx.shape_probe!=0);
+        if (verified < 0) return verified;
+    }
     *out = std::move(b.program());
     return RAD_OK;
 }

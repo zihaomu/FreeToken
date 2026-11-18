@@ -89,7 +89,7 @@ double loadavg1() {
 
 }  /* namespace */
 
-int Engine::run_diagnose() {
+int DeviceRuntime::run_diagnose() {
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::create_directories(cfg_.diagnose, ec);

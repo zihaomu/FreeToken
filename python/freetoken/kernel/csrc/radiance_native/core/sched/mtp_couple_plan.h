@@ -10,7 +10,7 @@
 #pragma once
 
 #include "batch.h"
-#include "scheduler.h"   /* Scheduler::SerialRow */
+#include "runtime/batch_state.h"
 
 #include "rad_spechub.h"
 
@@ -24,7 +24,7 @@ namespace rad {
  * RAD_OK, or RAD_E_STATE with `why` set: the plane is too small for the card slots, or a drafting
  * row's card carries no plan entry naming its sequence (a stale row -- the plugin would refuse the
  * staged draw, so it is refused here where the row can be named). */
-template <class Row>   /* Scheduler::SerialRow or Scheduler::BlockRow: a sequence and its card */
+template <class Row>   /* BatchState::SerialRow or BlockRow: a sequence and its card */
 inline int mtp_couple_plan_stage(const StepPlan& plan, int n_card, const Row* rows,
                                  int n, std::vector<RadMtpCoupleDraw>* by_card,
                                  RadMtpCoupleDraw* stage, std::string* why) {

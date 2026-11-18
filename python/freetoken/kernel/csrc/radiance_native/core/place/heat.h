@@ -197,10 +197,11 @@ struct TierMirror {
 
 class HeatEngine {
 public:
+    virtual ~HeatEngine() = default;
     /* Binds to the plan. A static plan is a mode, not a failure: init returns RAD_OK and
      * enabled() is false. Under Config::deterministic the plan is static and step() proposes
      * nothing for the whole run (spec §17). */
-    int init(const Plan& plan, const HeatParams& params);
+    virtual int init(const Plan& plan, const HeatParams& params);
     bool enabled() const { return enabled_; }
 
     /* ---- input: last step's routing histogram ------------------------------------------------
@@ -212,7 +213,7 @@ public:
      * `weight` is how many of the layer's routing passes this histogram stands for (see
      * Ctx::last_histogram_reports): 1 for a non-speculative step, n_spec for a draft head. It
      * scales the credit, not the decay, because every layer still decays exactly once a step. */
-    void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f);
+    virtual void observe(int32_t layer, const int32_t* counts, int32_t n_expert, float weight = 1.0f);
     /* The same, sparse: distinct expert ids and their counts. `counts` may be null for one each. */
     void observe_ids(int32_t layer, const int32_t* experts, const int32_t* counts, int32_t n);
     /* Starts fetching a histogram observe() will read. A row the card copied into host memory
@@ -226,8 +227,8 @@ public:
      *
      * Until publish both copies are valid and dispatch reads the old one, so the tier here must
      * match dispatch's view. `set_busy` is what keeps an in-flight unit from being picked again. */
-    void set_tier(int32_t unit, Tier t);
-    void set_busy(int32_t unit, bool busy);
+    virtual void set_tier(int32_t unit, Tier t);
+    virtual void set_busy(int32_t unit, bool busy);
     Tier tier(int32_t unit) const { return tier_[(size_t)unit]; }
     /* The tier as the HTTP thread may safely read it: set_tier mirrors every change into a
      * relaxed atomic, and /stats and LiveView read the mirror. tier_ itself belongs to the
@@ -267,7 +268,7 @@ public:
      * Every unit in the result is marked busy. The caller must either issue the transfer
      * (set_tier() on publish, set_busy(false) after the quarantine) or abandon() the pair. A
      * dropped proposal leaves both units busy forever, with no counter to show it. */
-    int step(std::vector<Swap>* out);
+    virtual int step(std::vector<Swap>* out);
     void abandon(const Swap& s);
 
     float heat(int32_t unit) const { return heat_[(size_t)pos_[(size_t)unit]]; }
@@ -284,6 +285,14 @@ public:
     /* Exit banner, ending with the per-layer resident counts, which show whether every layer kept
      * its share of slots. */
     std::string report() const;
+    virtual void order_candidates(std::vector<std::pair<float,int32_t>>&,bool hottest_first,size_t limit=0);
+    virtual std::vector<int32_t> fill_order(const std::vector<int32_t>&,const std::vector<int32_t>&,int64_t);
+    virtual const char* owner() const { return "reference"; }
+    virtual std::string control_report() const { return "{}"; }
+    virtual void published(int32_t,Tier,int64_t,uint64_t,RadEvent) {}
+    virtual bool authorize_move(int32_t,Tier,uint64_t) { return true; }
+    virtual bool authorize_loan(int,int64_t) { return true; }
+    virtual int plan_initial(const PlannerInput& input,Plan* out) { return Planner(input).plan(out); }
 
 private:
     HeatParams params_;

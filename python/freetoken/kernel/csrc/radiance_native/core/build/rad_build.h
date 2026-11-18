@@ -101,6 +101,9 @@ using WeightSourceFn = std::function<int(const std::string& name, const Program&
 /* ------------------------------------------------------------------ the builder */
 class Builder : public RadBuilder {
 public:
+    void set_state_layout(std::function<int(const char*, RadKVGroupDecl*)> fn) {
+        state_layout_ = std::move(fn);
+    }
     /* The Registry must outlive the Builder and its Program (see the file header). */
     Builder(Registry& reg, const RadModelMeta& meta, const RadBuildCtx& ctx);
 
@@ -253,6 +256,7 @@ private:
     /* The model's answers, cached per source: a routed model declares each expert's codes and
      * scales as two weights over one source, and a checkpoint lookup walks the name map. */
     WeightSourceFn sources_;
+    std::function<int(const char*, RadKVGroupDecl*)> state_layout_;
     std::unordered_map<std::string, std::pair<int, WeightSource>> source_cache_;
     int lookup_source(const std::string& name, WeightSource* out);
 

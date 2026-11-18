@@ -1,11 +1,11 @@
 // Modified for FreeToken: native integration, diagnostics and Qwen FP8 KV support.
-/* engine_priv.h -- shared by the Engine's translation units only.
+/* engine_priv.h -- shared by the DeviceRuntime's translation units only.
  *
- * `Engine` is one class split across several files by phase, which share little: bring-up runs
+ * `DeviceRuntime` is one class split across several files by phase, which share little: bring-up runs
  * once and touches every subsystem, the step loop runs constantly and touches a few, the drafters
  * are extra passes, and the probe is debug-only. The public surface in engine.h is unchanged.
  *
- * `Engine::Rank` is defined here, not in engine.h, because it names every subsystem's concrete
+ * `DeviceRuntime::Rank` is defined here, not in engine.h, because it names every subsystem's concrete
  * type; engine.h is included by main.cpp and the tools, which then need only a forward
  * declaration.
  */
@@ -31,8 +31,8 @@
 namespace rad {
 
 /* ================================================================== per-rank state */
-/* One tensor-parallel rank's state; see Engine::ranks_. */
-struct Engine::Rank {
+/* One tensor-parallel rank's state; see DeviceRuntime::ranks_. */
+struct DeviceRuntime::Rank {
     int       index = 0;
     int       device = 0;
     std::atomic<int64_t> native_thread_id{0};
@@ -47,7 +47,9 @@ struct Engine::Rank {
      * is dynamic. `heat_seen[l]` is the last step whose layer-l histogram was credited: a
      * histogram stays in its bank until the next report overwrites it, and must not be counted
      * twice. */
-    HeatEngine       heat;
+    std::unique_ptr<HeatEngine> heat_owner;
+    HeatEngine& heat;
+    explicit Rank(std::unique_ptr<HeatEngine> policy):heat_owner(std::move(policy)),heat(*heat_owner) {}
     std::vector<int> heat_seen;
     /* One sweep's histograms, found before any is credited; kept so a sweep allocates nothing. */
     struct HeatRow { int layer; int bank; const int32_t* h; };
@@ -57,7 +59,7 @@ struct Engine::Rank {
      * because its bank holds an already-credited step (the layer did not route). Counting these
      * apart keeps a placement engine starved of evidence from looking like idle layers. */
     uint64_t heat_credited = 0, heat_idle = 0;
-    /* Trunk steps in a row whose pass the prefill stager did not arm (Engine::tiering_dispatch). */
+    /* Trunk steps in a row whose pass the prefill stager did not arm (DeviceRuntime::tiering_dispatch). */
     int unstaged_steps = 0;
     KVManager kv;
     PrefixCache prefix;
@@ -66,7 +68,7 @@ struct Engine::Rank {
      * every KV block. Both are inert unless --prefix-cache-mib sizes the host tier. */
     IdleTiers tiers;
     TierExec  tierx;
-    /* The activation arena's smaller levels, smallest step first (Engine::probe_arena_levels). */
+    /* The activation arena's smaller levels, smallest step first (DeviceRuntime::probe_arena_levels). */
     std::vector<ArenaLevel> arena_levels;
     /* Per Ctx level (0 is the full plan): the bytes at the top of this rank's arena that level
      * leaves to the expert slab. */
@@ -100,7 +102,7 @@ struct Engine::Rank {
     int32_t   n_eog = 0;
 };
 
-/* The tiers' work in flight (Engine::tier_tick): one copy batch per rank's transfer stream at a
+/* The tiers' work in flight (DeviceRuntime::tier_tick): one copy batch per rank's transfer stream at a
  * time. Each rank's result is kept until all ranks have one, so a landed rank is not polled again
  * and a failure is not lost. */
 struct TierPump {

@@ -5,6 +5,10 @@ memory placement, prefetch, chained dispatch and tensor parallel collectives in 
 worker. FreeToken owns the API, chat formatting, tokenization, streaming and supervision.
 Python processes do not allocate the model or hold GPU contexts on this path.
 
+The v2 `native-kernels` backend transfers graph, batch, state and expert-policy ownership into
+FreeToken. Its [design and live qualification record](design/qwen38-tp2-v2.md) track the current
+implementation. The measurements below belong to `radiance-native` v1.
+
 This backend targets Linux x86_64, Radeon AI PRO R9700 (`gfx1201`), ROCm 10.1, TP1/TP2 and one
 active text generation. It loads a Qwen4Exp `.rad` file. The original NVFP4 expert bank cannot
 be passed to the IQR kernels. Keep the tokenizer directory matched to the `.rad` vocabulary.
@@ -110,3 +114,57 @@ at 2K and 198.84 tok/s at 32K input. This is decode throughput; the 32K full-req
 rate including prefill is about 45-46 tok/s. These use the authorized IQR-V4 derivative,
 not the original NVFP4 expert bank. The main repeated qualification and final-source
 single-boot control are reported separately.
+
+## Build and run the v2 components
+
+V2 stages into its own `freetoken/native/runtime-v2` prefix. Build it from this worktree in the
+qualified ROCm environment:
+
+```bash
+python -m freetoken.native.build \
+  --backend native-kernels --build-dir /path/to/v2-native-build --jobs 12
+```
+
+It packages `freetoken-batch-worker`, four kernel/quantizer plugins, licenses, a link map and
+source/binary identities. It does not package the original architecture plugin. Keep the stage
+with the matching Python package; an older staged worker cannot represent a newer source build.
+
+After reserving a matching GPU UUID/PCI pair, launch with:
+
+```bash
+HIP_VISIBLE_DEVICES="$RESERVED_GPU_UUIDS" \
+FREETOKEN_NATIVE_EXPECTED_PCIS="$RESERVED_GPU_PCIS_JSON" \
+python -m freetoken.cli serve \
+  --execution-backend native-kernels \
+  --model /models/qwen3.8-next-flash-iqr-v4.rad \
+  --tokenizer-path /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  --tensor-parallel-size 2 \
+  --native-mtp-depth 3 --native-kv-cache-dtype fp8 --native-wire exact \
+  --native-gpu-memory-mib 32000 --native-host-pool-mib 12288 \
+  --max-seq-len-override 34816 --max-extend-tokens 2048 \
+  --native-work-dir /path/to/v2-run \
+  --enable-timings-report --enable-cache-report
+```
+
+This uses the installed v2 worker by default. The qualified workload is text, batch1, FP8 KV,
+exact wire and MTP0/3. TP1 functional controls of this large model used 49152 MiB host memory;
+they do not qualify the TP2 budget. `--native-prefix-cache --native-prefix-cache-mib 1024`
+enables FreeToken's radix policy and the worker's bounded host snapshot provider. It is off
+for the initial speed comparison. Cache flush is supported while idle; online rebuild is
+unsupported. No CPU expert hybrid or multimodal execution has been added in v2.
+
+The terminal native snapshot distinguishes authorized, retired and committed steps, proposed/
+verified/accepted drafts and final committed tokens. `completion_fence_drained` and
+`as_of=final_state_release` identify the completed state lifetime; cumulative routing counters
+remain estimates of logical routing, separate from mover copy bytes. Fatal worker loss fails
+waiting requests and the service. Internal-rank fatal-signal and recoverable device-error
+qualification must be reported separately.
+
+Consult the live design record for per-build evidence. Final image15 TP2 batch1 qualification
+passes both independent A/A and balanced v1/v2 cohorts. Decode medians at 2K/32K are
+123.02/120.45 tok/s for MTP0 and 210.97/197.94 for MTP3. Paired retention is
+99.22%/99.11% and 100.42%/99.82%, respectively. All four input lengths pass the
+95% retention and TTFT/wall guards. These are decode rates; full request wall time includes
+prefill. Long-prefix, cancellation, context-end, installed-prefix/API and rank1 fatal-signal
+gates also pass. The installed prefix/image is qualified; an actual wheel build and
+recoverable HIP fault injection are separate work.

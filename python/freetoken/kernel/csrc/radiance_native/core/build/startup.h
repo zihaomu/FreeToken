@@ -17,6 +17,7 @@
 #include "build/rad_build.h"
 
 #include <functional>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <string>
@@ -27,7 +28,18 @@ namespace rad {
 /* A loaded plugin, as a tool names it. */
 struct PluginId { std::string name, version; };
 
+struct ProgramLowerer {
+    std::string name;
+    std::function<int(RadBuilder*, const RadModelMeta*, const RadBuildCtx*)> declare;
+    std::function<int(const RadModelMeta*, RadArchProbe*)> probe;
+    std::function<int(int, const char*, RadKVGroupDecl*)> state_layout;
+    std::function<int(const Program&, int, bool sizing)> validate;
+    void (*step)(RadCtx*, const RadBatch*) = nullptr;
+    uint64_t (*pass_key)(RadCtx*, const RadBatch*, const int32_t*) = nullptr;
+};
+
 struct LoadedPlugins {
+    std::shared_ptr<const ProgramLowerer> lowerer;
     /* Kernel plugins in hierarchy order, which decides selection. */
     std::vector<PluginId>       kernels;
     std::string                 arch_plugin;
@@ -79,7 +91,7 @@ int rad_tools_load_plugins(const std::string& radiance_home,
                            const std::string& arch_id,
                            const std::string& quant,
                            LoadedPlugins* out,
-                           bool imported = false);
+                           bool imported = false, bool architectures = true);
 
 /* The architecture plugin's rad_arch_probe answers, given before declare. */
 /* `gen_max_pixels`, `gen_max_refs`: the probe's inputs (RadArchProbe), the deployment's

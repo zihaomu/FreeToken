@@ -51,13 +51,18 @@ struct QkKvStore {
   void*                 cache;
   int   v_pitch, block_size, n_blocks;
   float k_inv = 1.0f, v_inv = 1.0f;
+  // The launch/tape ABI copies the entire struct, including its alignment gaps.
+  int                   reserved_alignment = 0;
   /* The streamed forms only: the group's host mirror and per-layer residency map, as
    * kv_store_streamed takes them (libr4d/r4d_model_bf16.hip). `blocks` is the mirror's block
    * count (the id space) while `n_blocks` stays the ring depth. */
   const int32_t*        res;
   void*                 host;
   int                   blocks;
+  int                   reserved_tail = 0;
 };
+static_assert(sizeof(QkKvStore) == 72 && offsetof(QkKvStore, res) == 48 &&
+              offsetof(QkKvStore, blocks) == 64);
 
 /* The cache forms KV selects: bf16 or the int8 cache, each resident or streamed (the same store
  * into the host mirror and, where the block is resident, the ring). */

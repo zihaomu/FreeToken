@@ -53,13 +53,19 @@ class EvictResult(NamedTuple):
 
 
 class HybridRadixCache:
-    def __init__(self, device: torch.device, page_size: int) -> None:
-        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    def __init__(self, device: torch.device, page_size: int, *,
+                 snapshot_alignment: int | None = None, key_compare=None) -> None:
+        alignment_name = "snapshot alignment"
+        if snapshot_alignment is None:
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+            snapshot_alignment = CHUNK_SIZE
+            alignment_name = "CHUNK_SIZE"
         # Snapshots land on ×CHUNK_SIZE boundaries; require them to be page-aligned so the KV
         # node boundary and the GDN-state boundary coincide (page_size in {1,2,4,8,16,32,64}).
-        assert CHUNK_SIZE % page_size == 0, (
-            f"hybrid_radix needs CHUNK_SIZE({CHUNK_SIZE}) % page_size({page_size}) == 0"
+        assert snapshot_alignment > 0 and snapshot_alignment % page_size == 0, (
+            f"hybrid_radix needs {alignment_name}({snapshot_alignment}) % page_size({page_size}) == 0"
         )
+        self.key_compare = key_compare
         self.device = device
         self.page_size = page_size
         self.key_fn = _get_key_fn(page_size)
@@ -284,7 +290,7 @@ class HybridRadixCache:
             if child is None:
                 return node, prefix_len
             node = child
-            match_len = align_down(node.get_match_len(input_ids[prefix_len:]), self.page_size)
+            match_len = align_down(node.get_match_len(input_ids[prefix_len:], self.key_compare), self.page_size)
             prefix_len += match_len
             if match_len != node.length:
                 node = node.split_at(match_len)

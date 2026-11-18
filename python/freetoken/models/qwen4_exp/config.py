@@ -104,19 +104,12 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
 
 
 def _layer_types(text: Any) -> list[str]:
-    layer_types = getattr(text, "layer_types", None)
-    if layer_types is not None:
-        # HF Qwen4ExpTextConfig rewrites full_attention to indexed_attention in __post_init__.
-        return [
-            "full_attention" if t == "indexed_attention" else t for t in layer_types
-        ]
-    # Fall back to full_attention_interval: every Nth layer (1-indexed) is full.
-    interval = int(getattr(text, "full_attention_interval", 4))
-    n = int(text.num_hidden_layers)
-    return [
-        "full_attention" if (i + 1) % interval == 0 else "linear_attention"
-        for i in range(n)
-    ]
+    from .composition import layer_schedule
+
+    return list(layer_schedule(
+        int(text.num_hidden_layers), int(getattr(text, "full_attention_interval", 4)),
+        getattr(text, "layer_types", None),
+    ))
 
 
 def parse_config(hf_config: Any) -> ModelConfig:

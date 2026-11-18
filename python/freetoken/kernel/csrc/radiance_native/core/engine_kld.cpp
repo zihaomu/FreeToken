@@ -1,4 +1,4 @@
-/* engine_kld.cpp -- the KL mode on the Engine: the driver that replaces the HTTP server, and the
+/* engine_kld.cpp -- the KL mode on the DeviceRuntime: the driver that replaces the HTTP server, and the
  * copy of a step's scored rows off the cards. The arithmetic and files are core/kld.h's. */
 #include "engine_priv.h"
 #include "kld.h"
@@ -23,7 +23,7 @@ namespace rad {
  * Without it, all are submitted under one hold of the queue, so batching depends only on the
  * corpus and the flags and a rerun batches identically. `progress` runs every `every_s` seconds
  * with the documents done and the seconds since the start. */
-int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
+int DeviceRuntime::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
                      std::vector<std::unique_ptr<server::Sink>>& sinks, bool fit_pool,
                      const char* tag, int every_s,
                      const std::function<void(size_t, double)>& progress, int* bad) {
@@ -94,7 +94,7 @@ int Engine::run_docs(std::vector<std::unique_ptr<Request>>& reqs,
     return RAD_OK;
 }
 
-int Engine::run_kld() {
+int DeviceRuntime::run_kld() {
     /* Each rank's logits buffer must hold a step's tokens after the sampler's rows
      * (RadBuildCtx::max_out_rows); a plugin that ignored the field is refused here rather than
      * overrun. */
@@ -239,7 +239,7 @@ int Engine::run_kld() {
  * tokens (RadBuildCtx::calib_tokens). A preempted request is prefilled again, which would count
  * its tokens twice, so the documents are fed so that it cannot (run_docs), and a run that
  * preempts all the same is reported as failed. */
-int Engine::run_calib() {
+int DeviceRuntime::run_calib() {
     if (!calib_) return RAD_E_STATE;
     const size_t n = calib_->n_docs();
     {
@@ -289,7 +289,7 @@ int Engine::run_calib() {
  * the batch builder's entry order (core/sched/batch.cpp), so the walk below repeats that loop and
  * checks the count. Each rank copies on its own stream behind the step; KL mode does not
  * pipeline, so the next step waits for this. */
-int Engine::score_rows(const RadBatch* b, const StepOut& so) {
+int DeviceRuntime::score_rows(const RadBatch* b, const StepOut& so) {
     const int64_t n = b->n_out - so.n_rows;
     if (n <= 0) return RAD_OK;
     const StepPlan& plan = sched_.plan();

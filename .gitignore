@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 python/freetoken/native/runtime/
+python/freetoken/native/runtime-v2/
 *.py[codz]
 *$py.class
 

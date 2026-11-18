@@ -24,6 +24,7 @@ class NativeServerArgs(ServerArgs):
     native_config: NativeConfig | None = None
     native_work_dir: str = ""
     native_descriptor: dict = field(default_factory=dict)
+    native_execution_mode: str = "radiance-native"
 
     @property
     def model_config(self):
@@ -44,19 +45,25 @@ class NativeServerArgs(ServerArgs):
 
 
 def launch_native(argv: list[str], run_shell: bool = False, prog: str | None = None,
-                  visibility: str = "", expected_pcis: str = "[]") -> None:
+                  visibility: str = "", expected_pcis: str = "[]",
+                  execution_backend: str = "radiance-native") -> None:
     from freetoken.launch import resolve_api_key
     from .api_server import run_api_server
     from .launch import _run_tokenize_worker
     from .supervisor import BackendHandle
-    from freetoken.engine.native_backend import run_native_backend
+    if execution_backend == "native-kernels":
+        from freetoken.engine.batch_backend import run_batch_backend as run_backend
+    else:
+        from freetoken.engine.native_backend import run_native_backend as run_backend
 
     p = argparse.ArgumentParser(prog=prog or "ft serve")
-    p.add_argument("--execution-backend", choices=["radiance-native"], required=True)
+    p.add_argument("--execution-backend", choices=["radiance-native", "native-kernels"], required=True)
     p.add_argument("--model", required=True)
     p.add_argument("--tokenizer-path", required=True)
-    runtime = Path(__file__).resolve().parents[1] / "native/runtime"
-    p.add_argument("--native-worker", default=os.environ.get("FREETOKEN_NATIVE_WORKER", str(runtime / "bin/freetoken-native-worker")))
+    batch = execution_backend == "native-kernels"
+    runtime = Path(__file__).resolve().parents[1] / ("native/runtime-v2" if batch else "native/runtime")
+    worker_name = "freetoken-batch-worker" if batch else "freetoken-native-worker"
+    p.add_argument("--native-worker", default=os.environ.get("FREETOKEN_NATIVE_WORKER", str(runtime / "bin" / worker_name)))
     p.add_argument("--native-home", default=os.environ.get("RADIANCE_HOME", str(runtime / "share/radiance")))
     p.add_argument("--native-work-dir", default=None)
     p.add_argument("--tensor-parallel-size", type=int, default=2)
@@ -84,6 +91,8 @@ def launch_native(argv: list[str], run_shell: bool = False, prog: str | None = N
     p.add_argument("--sampling-defaults", choices=["model", "none"], default="none")
     p.add_argument("--max-output-tokens", type=int, default=None)
     args = p.parse_args(argv)
+    if batch and (args.native_kv_cache_dtype != "fp8" or args.native_wire != "exact"):
+        p.error("native-kernels currently requires FP8 KV and exact wire")
     if not Path(args.tokenizer_path).is_dir():
         p.error("--tokenizer-path must name a local Hugging Face tokenizer directory")
     if args.api_key == "":
@@ -97,14 +106,18 @@ def launch_native(argv: list[str], run_shell: bool = False, prog: str | None = N
             visibility, tuple(json.loads(expected_pcis)), args.native_gpu_memory_mib,
             args.native_prefix_cache_mib,
         )
-        descriptor = inspect_model(native.worker, native.model)
+        if batch:
+            from freetoken.native.weight_source import RadWeightSource
+            descriptor = RadWeightSource(native.model).descriptor()
+        else:
+            descriptor = inspect_model(native.worker, native.model)
     except (ValueError, OSError) as exc:
         p.error(str(exc))
     work = args.native_work_dir or tempfile.mkdtemp(prefix="freetoken-native-")
     config = NativeServerArgs(
         model_path=args.tokenizer_path, tp_info=DistributedInfo(0, native.tensor_parallel),
         dtype=torch.bfloat16, native_config=native, native_work_dir=work,
-        native_descriptor=descriptor, max_running_req=1,
+        native_descriptor=descriptor, native_execution_mode=execution_backend, max_running_req=1,
         max_seq_len_override=native.max_context, max_extend_tokens=native.prefill_chunk,
         server_host=args.host, server_port=args.port, api_key=resolve_api_key(args.api_key),
         served_model_name=args.served_model_name, tool_call_parser=args.tool_call_parser,
@@ -117,7 +130,7 @@ def launch_native(argv: list[str], run_shell: bool = False, prog: str | None = N
     def start_backend():
         mp.set_start_method("spawn", force=True)
         ack = mp.Queue()
-        processes = [mp.Process(target=run_native_backend, args=(config, ack), name="freetoken-native-adapter")]
+        processes = [mp.Process(target=run_backend, args=(config, ack), name="freetoken-native-adapter")]
         processes.append(mp.Process(target=_run_tokenize_worker, kwargs={
             "detach": run_shell, "tokenizer_path": config.model_path,
             "addr": config.zmq_detokenizer_addr, "backend_addr": config.zmq_backend_addr,

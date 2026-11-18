@@ -122,6 +122,7 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
         RAD_WARN("mover: no Pools given; allocating the slab and host pool directly (test only)");
 
     unit_.assign(plan.units.size(), UnitState{});
+    placement_generation_.assign(plan.units.size(),0);
     copying_.assign(plan.units.size(), 0);
     pool_layer_.assign(plan.classes.size(), {});
     donors_.assign(plan.classes.size(), DonorRank{});
@@ -420,6 +421,16 @@ void Mover::republish(int32_t unit) {
     char* base = (char*)unit_base(unit);
     for (size_t i = 0; i < mu.weights.size(); ++i)
         res_.publish(mu.weights[i], base ? base + mu.offset[i] : nullptr);
+    notify_location(unit);
+}
+bool Mover::authorize(int32_t unit,Tier target) {
+    return !heat_ || heat_->authorize_move(unit,target,placement_generation_.at(size_t(unit)));
+}
+void Mover::notify_location(int32_t unit,RadEvent ready) {
+    if(!heat_)return;
+    const auto& state=unit_.at(size_t(unit));
+    heat_->published(unit,state.tier,state.slab_slot>=0?state.slab_slot:state.pool_slot,
+        ++placement_generation_.at(size_t(unit)),ready);
 }
 
 /* Whether a copy into this unit's slot is still in flight. A slot whose staging copy has not
@@ -585,6 +596,7 @@ int Mover::start_stage(int32_t unit, int64_t slab_slot) {
     const MoveUnit& mu = plan_->units[(size_t)unit];
     for (size_t i = 0; i < mu.weights.size(); ++i)
         res_.begin_transfer(mu.weights[i], base + mu.offset[i], m.ev);
+    notify_location(unit,m.ev);
     return RAD_OK;
 }
 
@@ -750,7 +762,8 @@ int32_t Mover::pick_victim(int32_t klass, const int32_t* protect, int n_protect,
         /* Hottest first; on equal heat the higher unit first, so the back is the coldest and,
          * among equally cold ones, the lowest: the unit a scan keeping its first strict minimum
          * would pick. */
-        std::sort(vr.by_heat.begin(), vr.by_heat.end(),
+        if(heat_) heat_->order_candidates(vr.by_heat,true);
+        else std::sort(vr.by_heat.begin(), vr.by_heat.end(),
                   [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
                       return a.first != b.first ? a.first > b.first : a.second > b.second;
                   });
@@ -824,6 +837,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             else slot = cp.slab.take_where([&](int64_t s) { return s < cp.n_fixed; });
             if (slot >= 0 && record_gate() < 0) { cp.slab.add_free(slot); slot = -1; }
             if (slot >= 0) {
+                if(!authorize(u,Tier::VRAM)) { cp.slab.add_free(slot);return RAD_E_STATE; }
                 char* const base = cp.slot_ptr(slot);
                 Move& m = moves_[(size_t)rec];
                 m.state = Move::State::Copying;
@@ -869,6 +883,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 const int32_t victim =
                     r2 >= 0 ? pick_victim(us.klass, protect, n_protect, heat_->heat(u)) : -1;
                 if (victim >= 0) {
+                    if(!authorize(victim,Tier::SSD))return RAD_E_STATE;
                     UnitState& vs = unit_[(size_t)victim];
                     const MoveUnit& mv = plan_->units[(size_t)victim];
                     Move& m2 = moves_[(size_t)r2];
@@ -887,10 +902,12 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                     /* No pool slot to promote from until a read deposits it again, which makes
                      * it movable once more; its layer's trigger reads it meanwhile. */
                     heat_->set_movable(victim, false);
+                    notify_location(victim);
                     ++stats_.pool_evictions;
                 }
             }
             if (g >= 0) {
+                if(!authorize(u,Tier::HostPinned)) { cp.pool.add_free(g);return RAD_E_STATE; }
                 Move& m = moves_[(size_t)rec];
                 m.state = Move::State::Copying;
                 m.kind = Move::Kind::Deposit;
@@ -917,6 +934,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 for (size_t k = 0; k < mu.weights.size(); ++k)
                     res_.publish(mu.weights[k],
                                  (char*)cp.pool_dev + g * cp.stride + mu.offset[k]);
+                notify_location(u,done);
                 frec_.push_back((int32_t)rec);
                 continue;
             }
@@ -967,6 +985,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         for (size_t j = 0; j < mu.weights.size(); ++j)
             res_.publish(mu.weights[j], fbase_[k - promoted0] + mu.offset[j]);
         stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
+        notify_location(u,done);
     }
     if (fext_.empty()) return RAD_OK;
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
@@ -1087,6 +1106,7 @@ int Mover::issue(const Swap& s, HeatEngine* heat) {
 
     auto one = [&](int32_t unit, bool promote) -> bool {
         if (unit < 0) return false;
+        if(!promote && !authorize(unit,Tier::HostPinned))return false;
         UnitState& us = unit_[(size_t)unit];
         if (us.klass < 0) return false;
         ClassPools& cp = pools_[(size_t)us.klass];
@@ -1183,6 +1203,8 @@ static char* align_down_ptr(char* p) {
 int Mover::lend_from(int lender, const std::vector<LoanStrip>& strips) {
     if (!plan_ || !plan_->dynamic) return RAD_OK;      /* a static plan never moves a unit */
     if (lender < 0 || lender >= kLenders) return RAD_E_INVAL;
+    int64_t granted=0;for(const auto& strip:strips)granted+=strip.bytes;
+    if(heat_ && !heat_->authorize_loan(lender,granted))return RAD_E_FULL;
     for (const ClassPools& cp : pools_)
         for (const ClassPools::Lent& l : cp.lent)
             if (l.lender == lender) {
@@ -1349,6 +1371,7 @@ void Mover::count_flex() {
 }
 
 int Mover::drop(int32_t unit, HeatEngine* heat) {
+    if(!authorize(unit,Tier::HostPinned))return RAD_E_STATE;
     const int rec = free_move_record();
     if (rec < 0) { ++stats_.no_record; return RAD_E_FULL; }
     UnitState& us = unit_[(size_t)unit];
@@ -1406,7 +1429,10 @@ int64_t Mover::donor_slot(size_t klass, int32_t layer, HeatEngine* heat) {
                 d.by_layer[(size_t)ul].push_back({ heat ? heat->heat(u) : 0.0f, u });
             }
         }
-        for (auto& v : d.by_layer) std::sort(v.begin(), v.end());
+        for (auto& v : d.by_layer) {
+            if(heat)heat->order_candidates(v,false);
+            else std::sort(v.begin(), v.end());
+        }
     }
     for (;;) {
         /* The hottest candidate of the layer asked for, or of every layer. */
@@ -1455,6 +1481,7 @@ int64_t Mover::pool_slot_for(int32_t unit, HeatEngine* heat) {
 }
 
 bool Mover::migrate(int32_t unit, HeatEngine* heat) {
+    if(!authorize(unit,Tier::VRAM))return false;
     UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
     const int64_t to = cp.slab.take();
@@ -1487,6 +1514,7 @@ bool Mover::migrate(int32_t unit, HeatEngine* heat) {
 }
 
 int Mover::promote_to(int32_t unit, int64_t slot) {
+    if(!authorize(unit,Tier::VRAM))return RAD_E_STATE;
     UnitState& us = unit_[(size_t)unit];
     ClassPools& cp = pools_[(size_t)us.klass];
     const int rec = free_move_record();
@@ -1513,6 +1541,24 @@ int Mover::promote_to(int32_t unit, int64_t slot) {
 
 int Mover::fill(size_t klass, int64_t room, HeatEngine* heat) {
     if (room <= 0) return RAD_OK;
+    if(heat) {
+        std::vector<int32_t> units,layers;
+        for(int32_t u=0;u<int32_t(unit_.size());++u) {
+            const auto& state=unit_[size_t(u)];const auto& unit=plan_->units[size_t(u)];
+            if(state.klass!=int32_t(klass) || state.tier!=Tier::HostPinned || state.pool_slot<0 ||
+               !unit.movable || heat->busy(u))continue;
+            units.push_back(u);layers.push_back(unit.layer);
+        }
+        for(const auto u:heat->fill_order(units,layers,room)) {
+            const auto slot=pools_[klass].slab.take_at_least(pools_[klass].n_fixed);
+            if(slot<0)break;
+            heat->set_busy(u,true);
+            if(promote_to(u,slot)<0) {
+                pools_[klass].slab.add_free(slot);heat->set_busy(u,false);break;
+            }
+        }
+        return RAD_OK;
+    }
     struct Cand { float h; int32_t layer; int32_t unit; };
     std::vector<Cand> cand;
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
@@ -1641,8 +1687,8 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
                 return a.first != b.first ? a.first < b.first : a.second < b.second;
             };
             const size_t k = std::min(drop_cand_.size(), (size_t)short_by);
-            std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),
-                              colder);
+            if(heat) heat->order_candidates(drop_cand_,false,k);
+            else std::partial_sort(drop_cand_.begin(), drop_cand_.begin() + (ptrdiff_t)k, drop_cand_.end(),colder);
             for (size_t i = 0; i < k; ++i) {
                 if (drop(drop_cand_[i].second, heat) < 0) break;
                 drained = true;
@@ -1656,6 +1702,7 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
         if (short_by > turn) {
             int32_t victim = -1;
             float coldest = 0.0f;
+            std::vector<std::pair<float,int32_t>> candidates;
             for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
                 const UnitState& us = unit_[(size_t)u];
                 if (us.klass != (int32_t)c || us.slab_slot < 0 || cp.is_flex(us.slab_slot)) continue;
@@ -1663,7 +1710,11 @@ int Mover::balance(HeatEngine* heat, bool turnover) {
                 if (!plan_->units[(size_t)u].movable && !unit_[(size_t)u].hot) continue;
                 if (heat && heat->busy(u)) continue;
                 const float h = heat ? heat->heat(u) : 0.0f;
+                if(heat)candidates.push_back({h,u});
                 if (victim < 0 || h < coldest) { victim = u; coldest = h; }
+            }
+            if(heat && !candidates.empty()) {
+                heat->order_candidates(candidates,false,1);victim=candidates[0].second;
             }
             if (victim >= 0) {
                 if (heat) heat->set_busy(victim, true);
@@ -1729,10 +1780,12 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
             }
             const int64_t g = to < 0 ? cp.pool.take() : -1;
             if (to >= 0) {
+                if(!authorize(u,Tier::VRAM)) { cp.slab.add_free(to);return RAD_E_STATE; }
                 dev_page_invalidate(cp.slot_ptr(to), us.bytes);
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
                 us.slab_slot = to;
             } else if (g >= 0) {
+                if(!authorize(u,Tier::HostPinned)) { cp.pool.add_free(g);return RAD_E_STATE; }
                 RAD_TRY(rad_memcpy_async((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(from),
                                          us.bytes, mover_));
                 us.pool_slot = g;
@@ -1756,6 +1809,7 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
             continue;
         }
         freed.push_back({ (size_t)us.klass, us.slab_slot });
+        if(!authorize(u,Tier::HostPinned))return RAD_E_STATE;
         us.slab_slot = -1;
         us.tier = Tier::HostPinned;
         us.site = Site::DeviceZeroCopy;

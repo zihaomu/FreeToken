@@ -290,7 +290,7 @@ def parse_args(
         return None
 
     parser = argparse.ArgumentParser(prog=prog, description="FreeToken Server Arguments")
-    parser.add_argument("--execution-backend", choices=["torch", "radiance-native"], default="torch",
+    parser.add_argument("--execution-backend", choices=["torch", "radiance-native", "native-kernels"], default="torch",
                         help="radiance-native uses its own early configuration path; see its --help")
 
     parser.add_argument(

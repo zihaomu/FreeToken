@@ -9,7 +9,7 @@
 #include "sample/mtp_couple_evidence.h"
 #include "sched/mtp_couple_bind.h"
 #include "sched/mtp_couple_plan.h"
-#include "sched/scheduler.h"
+#include "runtime/batch_state.h"
 #include "device/device.h"
 
 #include <algorithm>
@@ -25,7 +25,7 @@ namespace rad {
 /* ------------------------------------------------------------------ the card's step state */
 /* Every rank's zeroed StepSlots and sorted end-of-generation ids, and the pinned host copy of rank
  * 0's slots the step reads back. Allocated once at start, so the step path never allocates. */
-int Engine::step_state_init() {
+int DeviceRuntime::step_state_init() {
     std::vector<int32_t> eog;
     if (vocab_) eog = vocab_->eog();
     std::sort(eog.begin(), eog.end());
@@ -117,7 +117,7 @@ int Engine::step_state_init() {
     return RAD_OK;
 }
 
-void Engine::step_state_fini() {
+void DeviceRuntime::step_state_fini() {
     for (auto& rk : ranks_) {
         (void)rad_dev_set(rk->device);
         if (rk->step_slots) rad_dev_free(rk->step_slots, RAD_MEM_DEVICE);
@@ -154,13 +154,13 @@ void Engine::step_state_fini() {
  * tells the plugin to run the head. Tokens go out through set_draft(), like prompt lookup's; a
  * sequence the head declined keeps n_draft 0, leaving it to the n-gram drafter.
  */
-bool Engine::serial_drafting() const {
+bool DeviceRuntime::serial_drafting() const {
     return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
 }
 
 /* One advance on every rank against the scheduler's latest build, over its first `rows` rows
  * when given, else all. */
-int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
+int DeviceRuntime::advance_all(int mode, int round, bool from_proposal, int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
         AdvanceArgs a = sched_.advance_args((int)i);
@@ -198,7 +198,7 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
 
 /* ADV_COMPACT on every rank, against the scheduler's latest build (the tree step just accepted):
  * the accepted paths' K and V into place in every paged group. Each rank's pools are its own. */
-int Engine::tree_compact(int rows) {
+int DeviceRuntime::tree_compact(int rows) {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         Rank& rk = *ranks_[i];
         AdvanceArgs a = sched_.advance_args((int)i);
@@ -244,7 +244,7 @@ int Engine::tree_compact(int rows) {
  * history pass and every round, then the final proposal into the slots and their readback.
  * Nothing synchronises here: collect_step waits for the ids alone, and the step loop for the
  * passes after the commit, before finish_serial_drafter reads the slots. */
-int Engine::issue_serial_drafter(int step, StepOut& so) {
+int DeviceRuntime::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
@@ -355,7 +355,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
 /* After commit: check the host's acceptance against the card's, publish the proposals through
  * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
  * so a disagreement is a defect and the step is refused. */
-int Engine::finish_serial_drafter(const StepOut& so) {
+int DeviceRuntime::finish_serial_drafter(const StepOut& so) {
     if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
@@ -405,7 +405,7 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  * The position is the committed output length after this commit, the n_out the next build_step
  * reads. It comes from the scheduler's commit snapshot, not the plan's Request pointer, which
  * reap() may already have freed (sched/mtp_couple_bind.h). */
-int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card) {
+int DeviceRuntime::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t card) {
     MtpCoupleBindPoint bp;
     bp.found = sched_.committed_seq(seq, &bp.n_out, &bp.live);
     if (!bp.found)
@@ -437,7 +437,7 @@ int Engine::bind_couple(uint64_t seq, int i, int done, bool drafted, int32_t car
  * drafter's build_greedy does not clear, and checks that run() issued the verify for that build.
  * Sequences are re-checked as Running after the wait. Request numbers, the row count and the
  * kernel name only; a host-domain row is labelled as such. */
-void Engine::couple_verify_evidence(int step) {
+void DeviceRuntime::couple_verify_evidence(int step) {
     if (!mtp_couple_ || couple_evidence_) return;
     Sampler& smp = ranks_[0]->sampler;
     const rad_op op = smp.staged_couple_op();
@@ -465,7 +465,7 @@ void Engine::couple_verify_evidence(int step) {
  * writes; the propose op keeps the greedy proposal for a row whose draw names another card. The
  * rule is sched/mtp_couple_plan.h. */
 template <class Row>
-int Engine::stage_couple_draws(const Row* rows, int n) {
+int DeviceRuntime::stage_couple_draws(const Row* rows, int n) {
     std::string why;
     const int stg = mtp_couple_plan_stage(sched_.plan(),
                                           (int)(cfg_.max_seqs > 0 ? cfg_.max_seqs : 1),
@@ -506,7 +506,7 @@ int Engine::stage_couple_draws(const Row* rows, int n) {
 
 /* One drafter pass through the barrier. Neither pass samples (no logits in the context pass; the
  * query pass has its own selector), so the sampler chain is zero rows. */
-int Engine::block_pass(const RadBatch* db, const char* what, int step) {
+int DeviceRuntime::block_pass(const RadBatch* db, const char* what, int step) {
     for (auto& rk : ranks_) {
         int s = rk->sampler.build_greedy(0);
         if (s < 0) {
@@ -527,7 +527,7 @@ int Engine::block_pass(const RadBatch* db, const char* what, int step) {
     return s;
 }
 
-bool Engine::block_drafting() const {
+bool DeviceRuntime::block_drafting() const {
     return drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0;
 }
 
@@ -539,7 +539,7 @@ bool Engine::block_drafting() const {
  * collect_step waits for the sampled ids alone, so the commit streams the tokens while the card
  * runs both passes; the step loop waits for them (step_end_) before finish_block_drafter reads the
  * slots. */
-void Engine::block_shape(int* block, int* steps) {
+void DeviceRuntime::block_shape(int* block, int* steps) {
     *steps = drafter_.depth;
     /* The row count is the drafter's (defaulted and checked by declare_drafter). */
     *block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
@@ -547,7 +547,7 @@ void Engine::block_shape(int* block, int* steps) {
      * fewer proposals as rows. The load is the step just run's, which the next step, the one these
      * proposals are for, mostly repeats (Scheduler::short_block_on). */
     if (drafter_short_ <= 0) return;
-    short_on_ = Scheduler::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
+    short_on_ = BatchState::short_block_on(short_on_, sched_.decoded_seqs(), short_from_);
     if (short_on_) {
         /* A tree (rad_drafter_tree) grows a tree of its own over the shorter pass, at most its
          * draft positions of nodes (DFlash2 attends across its block, so the short pass is not the
@@ -558,7 +558,7 @@ void Engine::block_shape(int* block, int* steps) {
     }
 }
 
-int Engine::issue_block_drafter(int step, StepOut& so) {
+int DeviceRuntime::issue_block_drafter(int step, StepOut& so) {
     block_rows_ = 0;
     if (!block_drafting()) return RAD_OK;
 
@@ -620,7 +620,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
 /* After commit: check the host's acceptance against the card's, which positioned the query pass
  * (a disagreement is a defect and the step is refused, as in finish_serial_drafter), move the
  * drafter's filled range, and publish each row's proposal from the slots. */
-int Engine::finish_block_drafter(const StepOut& so) {
+int DeviceRuntime::finish_block_drafter(const StepOut& so) {
     if (!block_drafting()) return RAD_OK;
     if (block_rows_ > 0) {
         const StepPlan& plan = sched_.plan();

@@ -41,7 +41,8 @@ struct GbnfProgram;
 class Tokenizer;
 class ChatTemplate;
 class RadFile;
-class Engine;
+class DeviceRuntime;
+using Engine = DeviceRuntime;
 
 /* ================================================================== plugin layer */
 

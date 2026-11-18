@@ -484,6 +484,11 @@ public:
      * exact-schedule path is kept built and tested deliberately.
      */
     int begin_dispatch(int dispatch, HeatEngine* heat);
+    void bind_policy(HeatEngine* policy) {
+        heat_=policy;
+        // Allocation assigns the physical host slots after the plan was made.
+        if(heat_)for(size_t i=0;i<unit_.size();++i)notify_location(int32_t(i));
+    }
     int prefetch_to_op(int32_t op_index);
     int issue(const Swap& s, HeatEngine* heat);
 
@@ -773,6 +778,9 @@ private:
      * admission test (which units read into the hot cache) runs between dispatches on this
      * same thread. Null when heat is off — no hot cache, no evictable victims. */
     HeatEngine*    heat_ = nullptr;
+    std::vector<uint64_t> placement_generation_;
+    bool authorize(int32_t,Tier);
+    void notify_location(int32_t,RadEvent ready=nullptr);
     Pools*         budget_ = nullptr;
     /* True only when this object called the allocator itself (the test path). A Pool
      * reservation belongs to the Pool; freeing it here would be a double free. */

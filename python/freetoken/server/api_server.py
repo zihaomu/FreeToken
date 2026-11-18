@@ -900,7 +900,7 @@ def cache_geometry(state: Any) -> dict:
         "reasoning": reasoning,
     }
     if getattr(state, "native_backend_meta", None) is not None:
-        geo["execution_backend"] = "radiance-native"
+        geo["execution_backend"] = state.native_backend_meta.get("execution_backend", "radiance-native")
         geo["native"] = state.native_backend_meta
         geo["native_snapshot"] = getattr(tr, "native_stats", None)
     # Per-pool slider bounds, sized against the cache budget the rebuild fit-check actually

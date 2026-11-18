@@ -29,7 +29,8 @@
 #include "mem/hostarena.h"
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
-#include "sched/scheduler.h"
+#include "runtime/batch_state.h"
+#include "runtime/storage_view.h"
 #include "sample/vocab_view.h"
 #include "runtime/rank_barrier.h"
 #include "text/tokenizer.h"
@@ -50,6 +51,9 @@
 
 namespace rad {
 
+class ExternalStepControl;
+struct ExternalPermit;
+
 /* While on, the sweeps' pinned staging is kept for the next sweep, for a process that restores
  * models again and again; off frees what is kept. */
 void sweep_buffers_keep(bool on);
@@ -67,10 +71,11 @@ class XsTally;
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
 
-class Engine {
+class DeviceRuntime {
 public:
-    explicit Engine(Config cfg);
-    ~Engine();
+    explicit DeviceRuntime(Config cfg);
+    DeviceRuntime(Config cfg, std::unique_ptr<BatchState> batches);
+    ~DeviceRuntime();
 
     /* Steps 1..6. Returns negative after printing what failed and why; missing kernels are
      * reported as a full list. */
@@ -83,10 +88,20 @@ public:
      * reports where it waits like start() itself. */
     int serve(std::unique_ptr<StallWatch> watch);
 
-    using HeadlessFront = std::function<int(Scheduler&, std::shared_ptr<const Vocab>, const Json&)>;
+    using HeadlessFront = std::function<int(BatchState&, std::shared_ptr<const Vocab>, const Json&)>;
     int serve_headless(HeadlessFront front);
+    void set_external_step_control(std::shared_ptr<ExternalStepControl> control) {
+        external_steps_ = std::move(control);
+    }
+    void set_program_lowerer(std::shared_ptr<const ProgramLowerer> lowerer) {
+        program_lowerer_ = std::move(lowerer);
+    }
     int write_headless_manifest(const std::string& directory) const;
     Json headless_stats() const;
+    std::vector<StorageRankView> storage_rank_views();
+    void set_placement_factory(std::function<std::unique_ptr<HeatEngine>(int)> factory) {
+        placement_factory_=std::move(factory);
+    }
 
     /* Serve behind `front` (server/front.h) instead of listening: serve() attaches this model's
      * server under its name and `aliases` once it is ready, and returns after the front stops or
@@ -233,6 +248,7 @@ private:
      * than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
+    std::function<std::unique_ptr<HeatEngine>(int)> placement_factory_;
     /* Per rank and KV group, that rank's stream view or null; the batch builder takes these, since it
      * cannot reach each rank's manager. */
     std::vector<std::vector<const RadKVStream*>> rank_stream_views_;
@@ -248,9 +264,10 @@ private:
      * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
     uint64_t              startup_begin_ns_ = 0;
     std::vector<std::thread>           rank_threads_;
+    std::shared_ptr<ExternalStepControl> external_steps_;
 
     Config cfg_;
-    /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
+    /* The VRAM split each rank actually takes, filled by DeviceRuntime::plan. Equal to cfg_ on every
      * rank whose cache costs as much per token as the dearest rank's. A cheaper rank (an
      * attention-zero rank) gets a KV pool sized for the common token count and the difference in
      * its weights pool. Pools::configure and the planner must read the rank's entry, never cfg_;
@@ -272,6 +289,7 @@ private:
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
+    std::shared_ptr<const ProgramLowerer> program_lowerer_;
     /* This engine's share of the process plugin set (plugin/registry.h, Sharing): its device facts,
      * selection table and kernel instances. Made by load_plugins; plugins_.registry points at it. */
     std::unique_ptr<Registry> reg_;
@@ -369,7 +387,7 @@ private:
     /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
     bool ngram_gather_to_host();
     /* The table copies: locked ones as [base, base + bytes), pinned ones as rad_dev_alloc
-     * RAD_MEM_HOST_MAPPED ranges, and the container address each copies. Freed in ~Engine after
+     * RAD_MEM_HOST_MAPPED ranges, and the container address each copies. Freed in ~DeviceRuntime after
      * the ranks that read them are gone. */
     std::vector<TableCopy> table_copies_;
     std::vector<void*> card_copies_;
@@ -378,7 +396,7 @@ private:
     std::vector<TableShare> table_shares_;
     std::vector<std::pair<const void*, void*>> table_copy_of_;
     /* --ngram-placement disk=DIR: the table's own file, mapped read-only in place of the
-     * container's range (table_file_map); unmapped in ~Engine. */
+     * container's range (table_file_map); unmapped in ~DeviceRuntime. */
     std::vector<TableCopy> table_files_;
     std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
     int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
@@ -436,7 +454,8 @@ private:
     ChunkGeometry                 geo_;
 
     /* One scheduler for every rank: one decision per step, one batch, shared by pointer. */
-    Scheduler                     sched_;
+    std::unique_ptr<BatchState>    batch_state_owner_;
+    BatchState&                   sched_;
     std::unique_ptr<IKVManager>   kv_iface_;
     std::unique_ptr<IPrefixCache> pc_iface_;
 
@@ -645,7 +664,7 @@ private:
     int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
-    int  issue_ahead(const RadBatch** out);
+    int  issue_ahead(const RadBatch** out, ExternalPermit* permit = nullptr);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
@@ -654,7 +673,7 @@ private:
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
      * asked for, and the rounds that ran. */
-    std::vector<Scheduler::SerialRow> serial_row_;
+    std::vector<BatchState::SerialRow> serial_row_;
     int  serial_rounds_ = 0, serial_rows_ = 0, serial_done_ = 0;
     /* The StepSlots and end-of-generation ids on every rank, and the pinned host copy of rank 0's
      * slots the step reads back (sched/advance.h). */
@@ -731,7 +750,7 @@ private:
     void block_shape(int* block, int* steps);
     /* Handed from issue_block_drafter to finish_block_drafter and issue_ahead: the drafting rows,
      * in the query pass's order, and how many there are (0 when no query pass ran). */
-    std::vector<Scheduler::BlockRow> block_row_;
+    std::vector<BatchState::BlockRow> block_row_;
     int  block_rows_ = 0;
     /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
      * issue_ahead's expect_draft. */
@@ -761,7 +780,7 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
-    /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
+    /* The activation arena's loan (DeviceRuntime::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a
      * while, so a run of prefill chunks does not refill and recall the slab between chunks. */
@@ -769,7 +788,7 @@ private:
     void arena_tick(uint64_t now_ns);
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
-    /* The span's shared level (Engine::probe_arena_levels): the rows of the level a step of one
+    /* The span's shared level (DeviceRuntime::probe_arena_levels): the rows of the level a step of one
      * interval runs at under --prefill-span, where the prefill stager's ring is the level's own
      * (stager.h); 0 without one. */
     int64_t  arena_span_rows_ = 0;

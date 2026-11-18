@@ -13,6 +13,7 @@
  */
 #pragma once
 #include "batch.h"
+#include "runtime/batch_state.h"
 #include "draft.h"
 #include "lookup.h"
 #include "metrics.h"
@@ -147,35 +148,17 @@ struct SchedReq {
     }
 };
 
-class Scheduler {
+class Scheduler : public BatchState {
 public:
     /* What the sampler hands back after a step: per sequence, how many drafts survived, the token
      * sampled at the accepted position, and whether the sequence ended. No logits. commit() fills
      * in the two counts. */
-    struct StepResult {
-        int             n_seq = 0;
-        const int32_t*  n_accepted = nullptr;  /* [n_seq] drafted tokens accepted, 0..n_spec */
-        const int32_t*  token = nullptr;       /* [n_seq] token sampled at the accepted position */
-        const uint8_t*  eos = nullptr;         /* [n_seq] 1 when the sequence ended */
-        int             n_prefill_done = 0;   /* prompts this step fully placed */
-        int             n_finished = 0;       /* requests that ended during this step */
-        /* Logprobs, null on a step where no request asked: entry i's j-th emitted token (its
-         * accepted drafts first, then the sampled token) is lp[first_row[i] + j]. */
-        const TokenLogprobs* lp = nullptr;
-        const int32_t*       first_row = nullptr;  /* [n_seq] */
-        /* A tree step's accepted nodes, [n_seq][RAD_SCHED_MAX_SPEC]: entry i's t-th accepted
-         * draft is draft[path[i][t] - 1]. Null on a chain step, where it is draft[t]. */
-        const int32_t*       path = nullptr;
-    };
+
 
     /* What commit left a sequence at: its committed length and whether it is still Running.
      * Copied under the lock in commit because reap() may free the Request before the serial bind
      * reads it. */
-    struct CommittedSeq {
-        uint64_t seq = 0;
-        uint64_t n_out = 0;
-        bool     live = false;
-    };
+
 
     /* `geo` is the already-resolved chunk geometry. The engine resolves it once because
      * PrefixCache::configure runs first and needs its checkpoint interval; pass nullptr to
@@ -280,28 +263,7 @@ public:
      *
      * Per-request state for the dashboard and for debugging a stall. Copied out under the step
      * lock, since a pointer into scheduler storage could outlive a reaped request. */
-    struct ReqStat {
-        uint64_t id = 0;
-        int      state = 0;            /* ReqState, as an int -- the caller has the enum */
-        bool     running = false;
-        int64_t  prompt_tokens = 0;
-        int64_t  computed_tokens = 0;  /* of the prompt, how much is in the KV: prefill progress */
-        int64_t  cached_tokens = 0;    /* of those, how many came from the prefix cache */
-        int64_t  output_tokens = 0;
-        int64_t  max_tokens = 0;
-        int64_t  ctx_tokens = 0;       /* prompt ++ output */
-        /* This request's share of the paged pools: the blocks it holds and the tokens they cover.
-         * It differs from `ctx_tokens` (what it uses) by a partial block and by whatever a
-         * rejected draft left. */
-        int64_t  kv_blocks = 0;
-        int64_t  kv_tokens = 0;
-        int32_t  n_draft = 0;          /* the proposal standing for the next step */
-        int32_t  slot = -1;
-        double   age_s = 0;
-        double   ttft_s = -1;          /* negative until the first token */
-        double   prefill_s = -1;       /* first token minus admission; negative until both */
-        double   decode_tps = 0;       /* this request's own, since its first token */
-    };
+
     /* Oldest first, since the oldest is the one most likely stuck. Returns how many were
      * written. */
     int requests(ReqStat* out, int max) const;
@@ -407,11 +369,7 @@ public:
      *   set_draft   publishes each row's tokens like any other draft. A row the head declined
      *               keeps n_draft 0 and the n-gram drafter fills in.
      */
-    struct SerialRow {
-        uint64_t seq = 0;
-        int32_t  slot = -1;
-        int32_t  card = -1;
-    };
+
     int serial_begin(int* rounds, SerialRow* out, int max);
     const RadBatch* serial_batch(int round, int step);
     /* Round 0 is the history pass (null when no row needs one); round 1 is always null, because
@@ -445,11 +403,7 @@ public:
      * from the committed sequence. The engine does not use it; it is the reference the
      * scheduler's tests hold the card's staging to.
      */
-    struct BlockRow {
-        uint64_t seq = 0;
-        int32_t  slot = -1;
-        int32_t  card = -1;
-    };
+
     /* `block` is the drafter's trained block in rows, `depth` how many tokens it proposes (the
      * last `depth` rows), `window` its attention window (0 for none) and `mask` the token id its
      * masked query slots embed. Returns how many sequences may draft and fills `out` with them,
@@ -475,6 +429,7 @@ public:
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
+    const StepPlan&      next_plan() const { return plan_next_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
     LookupGate&          lookup_gate() { return lookup_; }
@@ -545,8 +500,9 @@ public:
     void    note_step_cost(bool chunk, double seconds);
 
 private:
+    std::mutex& batch_mutex() override { return mu_; }
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
-    friend class Engine;
+    friend class DeviceRuntime;
     /* Test-build-only observer at the concrete rollback operation. */
     void set_kv_rollback_test_hook(std::function<void(uint64_t, int, int, int64_t, bool)> hook) {
         kv_rollback_test_hook_ = std::move(hook);

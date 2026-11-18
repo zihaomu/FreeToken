@@ -77,15 +77,15 @@ bool is_file(const std::string& p) {
 }
 
 /* The combination's slot name: the adapters sorted by name, each at its strength. */
-std::string combo_key(const std::vector<Engine::LoraUse>& uses) {
+std::string combo_key(const std::vector<DeviceRuntime::LoraUse>& uses) {
     std::string k;
-    for (const Engine::LoraUse& u : uses) k += fmt("%s%s*%.6g", k.empty() ? "" : "+", u.name.c_str(), u.weight);
+    for (const DeviceRuntime::LoraUse& u : uses) k += fmt("%s%s*%.6g", k.empty() ? "" : "+", u.name.c_str(), u.weight);
     return k;
 }
 
 }  /* namespace */
 
-int Engine::lora_targets() {
+int DeviceRuntime::lora_targets() {
     if (!cfg_.lora.enabled()) return RAD_OK;
     lora_targets_ = std::set<std::string>(cfg_.lora.targets.begin(), cfg_.lora.targets.end());
     if (lora_targets_.empty()) {
@@ -107,7 +107,7 @@ int Engine::lora_targets() {
     return RAD_OK;
 }
 
-int Engine::lora_start() {
+int DeviceRuntime::lora_start() {
     if (!cfg_.lora.enabled()) return RAD_OK;
     lora_gen_ = ranks_[0]->program.is_pass_driven();
     if (!lora_gen_ && cfg_.lora.slots() < (int)cfg_.lora.adapters.size()) {
@@ -176,7 +176,7 @@ int Engine::lora_start() {
     return RAD_OK;
 }
 
-int Engine::lora_load(const std::string& name, const std::string& dir, std::string* err) {
+int DeviceRuntime::lora_load(const std::string& name, const std::string& dir, std::string* err) {
     std::lock_guard<std::mutex> lk(lora_mu_);
     if (!cfg_.lora.enabled()) { *err = "the engine was started without adapters"; return RAD_E_STATE; }
     if (name.empty()) { *err = "an adapter needs a name"; return RAD_E_INVAL; }
@@ -253,7 +253,7 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
     return RAD_OK;
 }
 
-int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
+int DeviceRuntime::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
                       std::string* err) {
     /* Each rank on a stream of its own: the compute stream may be recording a pass. */
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
@@ -313,12 +313,12 @@ int Engine::lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>
     return RAD_OK;
 }
 
-int Engine::lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
+int DeviceRuntime::lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
                          std::shared_ptr<void>* hold) {
     return lora_table_.acquire(name, slot, uid, hold);
 }
 
-int Engine::lora_unload(const std::string& name, std::string* err, int* in_flight) {
+int DeviceRuntime::lora_unload(const std::string& name, std::string* err, int* in_flight) {
     if (!lora_gen_) return lora_table_.unload(name, in_flight, err);
     /* A generator's adapter leaves the library, and every combination holding it its slot (at
      * once when idle, after its requests otherwise). */
@@ -348,12 +348,12 @@ int Engine::lora_unload(const std::string& name, std::string* err, int* in_fligh
     return RAD_OK;
 }
 
-std::vector<std::string> Engine::lora_names() const {
+std::vector<std::string> DeviceRuntime::lora_names() const {
     return lora_gen_ ? gen_lora_names() : lora_table_.names();
 }
 
 /* ================================================================== generator adapters */
-int Engine::gen_lora_start() {
+int DeviceRuntime::gen_lora_start() {
     /* Every slot's run of the slot-row table holds its own index (Program::lora_rows). */
     for (auto& rp : ranks_) {
         Rank& r = *rp;
@@ -390,7 +390,7 @@ int Engine::gen_lora_start() {
     return RAD_OK;
 }
 
-int Engine::gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
+int DeviceRuntime::gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
                           std::string* err) {
     {
         std::lock_guard<std::mutex> lk(lora_lib_mu_);
@@ -415,7 +415,7 @@ int Engine::gen_lora_open(const std::string& name, std::shared_ptr<const lora::A
     return RAD_OK;
 }
 
-std::vector<std::string> Engine::gen_lora_names() const {
+std::vector<std::string> DeviceRuntime::gen_lora_names() const {
     std::set<std::string> n;
     {
         std::lock_guard<std::mutex> lk(lora_lib_mu_);
@@ -447,7 +447,7 @@ std::vector<std::string> Engine::gen_lora_names() const {
     return std::vector<std::string>(n.begin(), n.end());
 }
 
-int Engine::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
+int DeviceRuntime::gen_lora_acquire(const std::vector<LoraUse>& uses_in, int32_t* slot,
                              std::shared_ptr<void>* hold, std::string* note, std::string* err) {
     *slot = -1;
     hold->reset();

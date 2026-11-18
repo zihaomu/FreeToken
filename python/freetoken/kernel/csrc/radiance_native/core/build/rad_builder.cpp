@@ -344,6 +344,12 @@ rad_buf Builder::decl_buffer(const char* name, const RadBufDecl* d) {
 rad_kvgroup Builder::decl_kv_group(const char* name, const RadKVGroupDecl* d) {
     if (finished_) return err(RAD_E_STATE, "decl_kv_group('%s') after declare finished", name ? name : "");
     if (!name || !*name || !d) return err(RAD_E_INVAL, "decl_kv_group: null name or declaration");
+    RadKVGroupDecl planned = *d;
+    if (state_layout_) {
+        const int st = state_layout_(name, &planned);
+        if (st < 0) return err(st, "kv group '%s' differs from the FreeToken state plan", name);
+        d = &planned;
+    }
     if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_RING)
         return err(RAD_E_INVAL, "kv group '%s': unknown kind %d", name, d->kind);
 

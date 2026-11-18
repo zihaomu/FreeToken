@@ -132,6 +132,7 @@ struct MoeFP8 {
         int64_t expert_base  = 0;
         int64_t top_k        = 0;
         int64_t n_ff_exp     = 0;   /* one expert's intermediate width, per rank */
+        int64_t protected_lo = -1, protected_hi = -1;
         /* This rank's slice of each routed expert when the width does not halve into whole fp8
          * scale blocks: expert e's intermediate columns [ff_lo[e % 2], ff_hi[e % 2]) in model
          * numbering, by parity. hi 0 is the even split (or none). `n_ff_exp` is then the wider
@@ -362,6 +363,8 @@ struct MoeFP8 {
         const char* shared_mlp_up   = nullptr;
         const char* shared_mlp_down = nullptr;
         const char* shared_gate = nullptr;   /* mlp.shared_expert_gate.weight, [1, n_embd] */
+        const std::vector<int64_t>* regular_order = nullptr;
+        const std::vector<int64_t>* protected_order = nullptr;
     };
 
     Geom   g{};
@@ -836,6 +839,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             return RAD_E_DTYPE;
         }
     }
+    if (src.protected_order) {
+        if (prot != *src.protected_order) return RAD_E_DTYPE;
+        prot = *src.protected_order;
+    }
     n_reg = ne - (int64_t)prot.size();
     if (!prot.empty()) {
         if ((int64_t)prot.size() > kMaxProtected) {
@@ -978,6 +985,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     reg.reserve((size_t)n_reg);
     for (int64_t e = 0; e < ne; ++e)
         if (std::find(prot.begin(), prot.end(), e) == prot.end()) reg.push_back(e);
+    if (src.regular_order) {
+        if (reg != *src.regular_order) return RAD_E_INVAL;
+        reg = *src.regular_order;
+    }
     w_gu.resize((size_t)ne); w_gus.resize((size_t)ne);
     w_dn.resize((size_t)ne); w_dns.resize((size_t)ne);
     /* Each class's width on this rank: the Config's slice when split unevenly, else `n_ff_exp`.
@@ -1359,7 +1370,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             psh_row = RAD_SHARD_ROW;
             psh_col = RAD_SHARD_COL;
             pparts  = (int)gu;
-            if (full % g.world == 0 && (full / g.world) % 64 == 0) {
+            if (c.protected_hi > 0) {
+                plo = c.protected_lo; phi = c.protected_hi;
+                if (plo < 0 || phi > full || phi <= plo || plo % 64 || (phi - plo) % 64)
+                    return RAD_E_INVAL;
+                wp = phi - plo;
+            } else if (full % g.world == 0 && (full / g.world) % 64 == 0) {
                 wp = full / g.world;
             } else if (full % 64 || full / 64 < g.world) {
                 fprintf(stderr, "radiance: layer %d's plain experts are %lld wide, which %d ranks "

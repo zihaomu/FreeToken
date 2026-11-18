@@ -132,7 +132,7 @@ def launch_server(
     backend_parser = argparse.ArgumentParser(add_help=False)
     backend_parser.add_argument("--execution-backend", default="torch")
     backend, _ = backend_parser.parse_known_args(actual_argv)
-    if backend.execution_backend == "radiance-native":
+    if backend.execution_backend in ("radiance-native", "native-kernels"):
         visibility = os.environ.get("HIP_VISIBLE_DEVICES", "")
         expected_pcis = os.environ.get("FREETOKEN_NATIVE_EXPECTED_PCIS", "[]")
         os.environ["HIP_VISIBLE_DEVICES"] = "-1"
@@ -140,7 +140,8 @@ def launch_server(
         from .native import launch_native
 
         launch_native(actual_argv, run_shell=run_shell, prog=prog,
-                      visibility=visibility, expected_pcis=expected_pcis)
+                      visibility=visibility, expected_pcis=expected_pcis,
+                      execution_backend=backend.execution_backend)
         return
     if backend.execution_backend != "torch":
         raise SystemExit(f"unknown execution backend: {backend.execution_backend}")

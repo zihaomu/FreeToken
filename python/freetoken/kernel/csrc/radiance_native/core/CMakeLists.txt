@@ -1,5 +1,5 @@
-# One static library. The engine is monolithic on purpose (spec §head): substitution happens at the
-# plugin boundary, so .so seams inside it buy nothing.
+# The reference host links this archive whole. The FreeToken batch worker links
+# reachable components and exports only the runtime C ABI and HIP interposition.
 #
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS. Re-run cmake if a new file does not
 # appear.
@@ -30,6 +30,7 @@ list(REMOVE_ITEM RAD_CORE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/util/simd.cpp
                               ${CMAKE_CURRENT_SOURCE_DIR}/util/simd_kernels.cpp
                               ${CMAKE_CURRENT_SOURCE_DIR}/util/json.cpp)
 add_library(rad_core STATIC ${RAD_CORE_SRC})
+target_compile_options(rad_core PRIVATE -ffunction-sections -fdata-sections)
 target_link_libraries(rad_core PUBLIC rad_abi ${CMAKE_DL_LIBS} Threads::Threads)
 
 add_library(rad_simd STATIC ${CMAKE_CURRENT_SOURCE_DIR}/util/simd.cpp)

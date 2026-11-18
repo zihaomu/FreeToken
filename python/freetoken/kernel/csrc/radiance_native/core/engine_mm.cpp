@@ -25,7 +25,7 @@
 
 namespace rad {
 
-int Engine::run_encodes() {
+int DeviceRuntime::run_encodes() {
     std::vector<std::shared_ptr<mm::Item>> items;
     sched_.take_encodes(&items);
     if (items.empty()) return RAD_OK;
@@ -148,7 +148,7 @@ int Engine::run_encodes() {
             if (!b) return RAD_E_STATE;
             RAD_TRY(prepare_release(b));
             /* Read the output address after prepare_release: a pass runs at the arena's full plan
-             * (Engine::arena_step), and a buffer's offset differs per level. */
+             * (DeviceRuntime::arena_step), and a buffer's offset differs per level. */
             void* out = r0.ctx.buf_ptr(enc.out);
             if (!out) {
                 RAD_ERR("encoder '%s': its output buffer was declared but never planned",

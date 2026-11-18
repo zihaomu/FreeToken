@@ -78,7 +78,9 @@ class RadixTreeNode:
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
-    def get_match_len(self, input_ids: torch.Tensor) -> int:
+    def get_match_len(self, input_ids: torch.Tensor, compare=None) -> int:
+        if compare is not None:
+            return compare(self._key, input_ids)
         from freetoken.kernel import fast_compare_key
 
         # compare key and input_ids, find the first diff

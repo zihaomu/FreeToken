@@ -28,6 +28,124 @@ from freetoken.message import (
 from freetoken.core import SamplingParams
 
 
+def test_executor_batch_wire_matches_independent_header_and_keeps_uid_zero():
+    import socket
+    import struct
+    from freetoken.engine.backend import (
+        ExecutionWindow, Phase, RequestKey, ResourceHandle, StateCursor,
+    )
+    from freetoken.native.executor_protocol import Kind, decode_step, encode_step, recv_frame
+
+    state, executable = ResourceHandle(7, 2, 1, 1), ResourceHandle(7, 2, 2, 1)
+    window = ExecutionWindow(RequestKey(0, 3), 7, state, StateCursor(0, 0))
+    plan = window.grant(executable, Phase.PREFILL, 1, 4, input_ids=(0, 248319, 42))
+    payload = encode_step(plan)
+    left, right = socket.socketpair()
+    try:
+        # Literal layout is independent of the protocol encoder.
+        left.sendall(struct.pack("<IHHIIQQ", 0x32585446, 3, 4, len(payload), 0, 0, 3) + payload)
+        kind, uid, epoch, encoded = recv_frame(right)
+        assert (kind, uid, epoch) == (Kind.SUBMIT, 0, 3)
+        assert decode_step(encoded) == plan
+    finally:
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_executor_credit_drain_keeps_out_of_order_gpu_state_alive(cancel):
+    from dataclasses import replace
+    from freetoken.engine.backend import (
+        Completion, ExecutionWindow, Phase, RequestKey, ResourceHandle, StateCursor,
+    )
+
+    state, executable = ResourceHandle(1, 1, 1, 1), ResourceHandle(1, 1, 2, 1)
+    initial = StateCursor(5, 4, 42)
+    window = ExecutionWindow(RequestKey(0, 1), 1, state, initial, limit=2)
+    first = window.grant(executable, Phase.MTP, 4, 11, draft_depth=3)
+    second = window.grant(executable, Phase.MTP, 4, 17, draft_depth=3)
+    middle, final = StateCursor(7, 6, 19), StateCursor(8, 7, 20)
+    c1 = Completion(first.ticket, replace(state, version=2), initial, middle,
+                    (18, 19), (True, False))
+    c2 = Completion(second.ticket, replace(state, version=3), middle, final, (20,), (False,))
+    if cancel:
+        window.revoke()
+    assert window.complete(c2) == ()
+    assert not window.drained
+    assert window.cursor == initial
+    assert window.complete(c1) == (() if cancel else (c1, c2))
+    assert window.drained
+    assert window.cursor == (initial if cancel else final)
+    with pytest.raises(ValueError):
+        window.complete(c1)
+
+
+def test_executor_terminal_trimming_retires_physical_state_before_reuse():
+    from dataclasses import replace
+    from freetoken.engine.backend import (
+        Completion, ExecutionWindow, Phase, RequestKey, ResourceHandle, StateCursor,
+    )
+    from freetoken.native.executor_protocol import decode_completion, encode_completion
+
+    state, executable = ResourceHandle(1, 1, 1, 1), ResourceHandle(1, 1, 2, 1)
+    cursor = StateCursor(10, 9, 42)
+    window = ExecutionWindow(RequestKey(0, 1), 1, state, cursor)
+    with pytest.raises(ValueError):
+        window.grant(executable, Phase.MTP, 1, 11, draft_depth=3)
+    with pytest.raises(ValueError):
+        window.grant(executable, Phase.MTP, 1, 14, draft_depth=3)
+    plan = window.grant(executable, Phase.MTP, 1, 16, draft_depth=3)
+    result = Completion(plan.ticket, replace(state, version=2), cursor, None, (43,), (True,),
+                        terminal_frontier=11, terminal_reason="length",
+                        retired_computed_tokens=13, proposed_drafts=3,
+                        verified_drafts=3, accepted_drafts=2)
+    with pytest.raises(ValueError, match="accepted drafts"):
+        replace(result, accepted_drafts=3, verified_drafts=2)
+    assert decode_completion(encode_completion(result)) == result
+    assert window.complete(result) == (result,)
+    assert window.terminal_frontier == 11 and window.revoked and window.drained
+    with pytest.raises(RuntimeError):
+        window.grant(executable, Phase.DECODE, 1, 12)
+
+
+def test_executor_reservation_rebases_after_actual_speculative_acceptance():
+    from dataclasses import replace
+    from freetoken.engine.backend import (
+        Completion, ExecutionWindow, Phase, RequestKey, ResourceHandle, StateCursor,
+    )
+
+    state, executable = ResourceHandle(1, 1, 1, 1), ResourceHandle(1, 1, 2, 1)
+    initial = StateCursor(5, 4, 42)
+    window = ExecutionWindow(RequestKey(0, 1), 1, state, initial, limit=2)
+    first = window.grant(executable, Phase.MTP, 4, 11, draft_depth=3)
+    window.grant(executable, Phase.MTP, 4, 17, draft_depth=3)
+    actual = StateCursor(6, 5, 43)
+    window.complete(Completion(first.ticket, replace(state, version=2),
+                              initial, actual, (43,), (False,)))
+    # The unaccepted three-token estimate must not accumulate in every future reservation.
+    assert window.reservation_floor == 12
+    next_plan = window.grant(executable, Phase.MTP, 4, 18, draft_depth=3)
+    assert next_plan.reserved_through == 18
+
+
+@pytest.mark.parametrize("payload", [
+    b'{"step_id":1,"step_id":2}', b'{"scale":NaN}', b'{"scale":Infinity}',
+])
+def test_executor_refuses_ambiguous_or_nonfinite_wire_metadata(payload):
+    from freetoken.native.executor_protocol import decode
+
+    with pytest.raises(ValueError):
+        decode(payload)
+
+
+@pytest.mark.parametrize("committed,computed,pending", [(5, 3, 42), (5, 5, 42), (5, 4, None)])
+def test_executor_distinguishes_sampled_and_computed_state_frontiers(committed, computed, pending):
+    from freetoken.engine.backend import StateCursor
+
+    with pytest.raises(ValueError):
+        StateCursor(committed, computed, pending)
+
+
 @pytest.mark.parametrize("count", [0, 1, 4])
 @pytest.mark.parametrize("terminal", [False, True])
 def test_native_committed_tokens_keep_epoch_and_binary_ids(count, terminal):

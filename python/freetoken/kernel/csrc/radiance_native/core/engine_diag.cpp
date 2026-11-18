@@ -17,7 +17,7 @@ namespace {
 constexpr uint64_t kDiagReuseNs = 1000000000ull;
 }  /* namespace */
 
-void Engine::identify_devices(const std::vector<std::string>& names) {
+void DeviceRuntime::identify_devices(const std::vector<std::string>& names) {
     dev_ids_.clear();
     runtime_version_ = dev_runtime_version();
     for (int d = 0; d < (int)names.size(); ++d) {
@@ -31,11 +31,11 @@ void Engine::identify_devices(const std::vector<std::string>& names) {
     }
 }
 
-void Engine::print_unsupported_banner() {
+void DeviceRuntime::print_unsupported_banner() {
     for (const std::string& l : diag::unsupported_banner()) RAD_WARN("%s", l.c_str());
 }
 
-int Engine::check_configuration(const std::vector<int>& devs) {
+int DeviceRuntime::check_configuration(const std::vector<int>& devs) {
     diag::Facts f = hardware_facts(false);
     for (int i = 0; i < cfg_.tp && i < (int)devs.size(); ++i)
         for (diag::CardFacts& c : f.cards)
@@ -58,7 +58,7 @@ int Engine::check_configuration(const std::vector<int>& devs) {
     return RAD_E_UNSUPPORTED;
 }
 
-diag::Facts Engine::hardware_facts(bool serving) const {
+diag::Facts DeviceRuntime::hardware_facts(bool serving) const {
     std::vector<std::string> mine;
     for (const DevId& id : dev_ids_)
         for (const auto& r : ranks_)
@@ -83,7 +83,7 @@ diag::Facts Engine::hardware_facts(bool serving) const {
     return f;
 }
 
-diag::RunFacts Engine::run_facts(bool failed) const {
+diag::RunFacts DeviceRuntime::run_facts(bool failed) const {
     diag::RunFacts r;
     r.version         = RAD_VERSION;
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP
@@ -130,7 +130,7 @@ diag::RunFacts Engine::run_facts(bool failed) const {
     return r;
 }
 
-void Engine::print_startup_report(int status) {
+void DeviceRuntime::print_startup_report(int status) {
     report_printed_ = true;
     if (!probed_) {
         diag::HostFacts h;
@@ -173,7 +173,7 @@ void Engine::print_startup_report(int status) {
                 rad_strerror(status));
 }
 
-std::string Engine::diagnostics_json() const {
+std::string DeviceRuntime::diagnostics_json() const {
     std::vector<diag::ConfigRow> rows = diag::config_rows(cfg_);
     std::vector<diag::Decision> derived;
     diag::merge(&rows, decisions_, &derived);

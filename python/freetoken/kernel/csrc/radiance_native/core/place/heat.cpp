@@ -3,8 +3,41 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <queue>
 
 namespace rad {
+void HeatEngine::order_candidates(std::vector<std::pair<float,int32_t>>& units,bool hottest,size_t limit) {
+    const auto compare=[hottest](const auto& a,const auto& b) {
+        return a.first!=b.first?(hottest?a.first>b.first:a.first<b.first):
+                               (hottest?a.second>b.second:a.second<b.second);
+    };
+    if(limit && limit<units.size())std::partial_sort(units.begin(),units.begin()+ptrdiff_t(limit),units.end(),compare);
+    else std::sort(units.begin(),units.end(),compare);
+}
+std::vector<int32_t> HeatEngine::fill_order(const std::vector<int32_t>& units,const std::vector<int32_t>& layers,int64_t room) {
+    struct Candidate { float heat;int32_t layer,unit; };
+    std::vector<Candidate> candidates;
+    for(size_t i=0;i<units.size();++i)candidates.push_back({heat(units[i]),layers.at(i),units[i]});
+    std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b){return a.heat>b.heat;});
+    std::map<int32_t,int32_t> added;
+    std::vector<int32_t> result;
+    for(size_t i=0;i<candidates.size() && int64_t(result.size())<room;) {
+        size_t j=i;while(j<candidates.size() && candidates[j].heat==candidates[i].heat)++j;
+        std::map<int32_t,std::vector<int32_t>> by_layer;
+        for(size_t k=j;k-->i;)by_layer[candidates[k].layer].push_back(candidates[k].unit);
+        using Key=std::pair<int32_t,int32_t>;
+        std::priority_queue<Key,std::vector<Key>,std::greater<Key>> queue;
+        for(const auto& row:by_layer)queue.push({layer_residents(row.second.back())+added[row.first],row.first});
+        while(!queue.empty() && int64_t(result.size())<room) {
+            const auto key=queue.top();queue.pop();auto& row=by_layer[key.second];
+            result.push_back(row.back());row.pop_back();++added[key.second];
+            if(!row.empty())queue.push({key.first+1,key.second});
+        }
+        i=j;
+    }
+    return result;
+}
 
 namespace {
 /* The width of one observe() block: a layer's run of positions is a whole number of these, so

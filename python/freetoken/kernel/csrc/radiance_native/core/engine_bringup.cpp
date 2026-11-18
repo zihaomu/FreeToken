@@ -1,9 +1,9 @@
 // Modified for FreeToken: exact hybrid prefix chunk namespaces.
-/* engine_bringup.cpp -- everything the Engine does once, in order: devices, the container's
+/* engine_bringup.cpp -- everything the DeviceRuntime does once, in order: devices, the container's
  * metadata, the plugins, declare, the placement plan, the weights, the KV pools, the rank threads
  * and the vocabulary. Each numbered section is one component doing its own job.
  *
- * Separate from engine.cpp (the hot step loop), with which it shares only the Engine's fields.
+ * Separate from engine.cpp (the hot step loop), with which it shares only the DeviceRuntime's fields.
  */
 #include "engine_priv.h"
 #include "rad_internal.h"
@@ -31,7 +31,7 @@
 #include "runtime/kvbind.h"
 #include "runtime/xprefetch.h"
 #include "sample/gbnf.h"
-#include "sched/scheduler.h"
+#include "runtime/batch_state.h"
 #include "text/token_view.h"
 #include "text/tokenizer.h"
 
@@ -163,7 +163,7 @@ static MissReport miss_report(const Program& p, bool host_backend) {
  * what it skipped. ROCR_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES control what the runtime exposes.
  *
  * `names` receives every device's product name by index ("" if unreadable), for
- * Engine::identify_devices, so the properties are read only once. */
+ * DeviceRuntime::identify_devices, so the properties are read only once. */
 static int usable_devices(std::vector<int>* out, std::string* inventory, std::string* note,
                           std::vector<std::string>* names) {
     const int n = rad_dev_count();
@@ -206,7 +206,7 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
     return out->empty() ? RAD_E_DEVICE : RAD_OK;
 }
 
-int Engine::usable_cards(std::vector<int>* out) {
+int DeviceRuntime::usable_cards(std::vector<int>* out) {
     std::string inventory, note;
     std::vector<std::string> names;
     out->clear();
@@ -292,11 +292,11 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
 }
 
 /* ------------------------------------------------------------------ locked host memory */
-int64_t Engine::host_margin_bytes() const {
+int64_t DeviceRuntime::host_margin_bytes() const {
     return std::max(host_headroom_bytes(), broker_ ? broker_->host_margin() : (int64_t)0);
 }
 
-/* The margin (--host-headroom-mib, Engine::host_headroom_bytes): host memory left free beside a
+/* The margin (--host-headroom-mib, DeviceRuntime::host_headroom_bytes): host memory left free beside a
  * table locked whole -- the process's unpooled allocations, the load's staging windows, and the
  * page cache holding the container's hot pages. Without it the kernel reclaims the files the
  * engine reads, then the OOM killer runs. It is dead RAM by design; a host that can reclaim
@@ -375,8 +375,8 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
  * container, and pins it either way. Only a table of kTableShareMin or more is shared: the gather's
  * scale is an n-gram weight too, since it moves with the table between gather sites, and as a file
  * its two bytes would cost the 2 MiB header and a 2 MiB page. One copy per container address,
- * shared by every rank; freed in ~Engine. */
-int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
+ * shared by every rank; freed in ~DeviceRuntime. */
+int DeviceRuntime::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
@@ -456,7 +456,7 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
  * later start checks samples of it against the container. Mapped read-only in place of the
  * container's range, which is all the disk gather needs: it finds the file behind the mapping and
  * reads it directly (libavx avx_ngram.cpp, table_file). */
-int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
+int DeviceRuntime::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out,
                            std::string* why) {
     const auto t0 = std::chrono::steady_clock::now();
     const std::string id = table_share_id(file_->path(), foff, n);
@@ -483,7 +483,7 @@ int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** o
  * Ctx::init reads and the plan, so the gather and its scale move together; a copy already
  * published is host memory the host gather can read. False when no host kernel gathers the
  * table. */
-bool Engine::ngram_gather_to_host() {
+bool DeviceRuntime::ngram_gather_to_host() {
     for (auto& r : ranks_) {
         WeightFootprint f;
         weight_footprint(r->program, &f, TablePlacement::Vram, TablePlacement::Disk,
@@ -517,7 +517,7 @@ bool Engine::ngram_gather_to_host() {
  * Each tier is refused where no kernel reads it. Auto takes the first that fits, in that order.
  * The card test: the fixed weights plus a KV pool for one --max-model-len sequence (`kv_floor`).
  * The RAM test: lockable_room after the pools still to be allocated. */
-int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
+int DeviceRuntime::resolve_table_placement(const std::vector<VramFacts>& facts,
                                     const std::vector<int64_t>& emb_bytes,
                                     const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
                                     int64_t ngram_bytes, bool ngram_device, bool ngram_host,
@@ -550,7 +550,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                   "whole, every step)";
     } else if (emb == TablePlacement::Ram) {
         if (!emb_room()) {
-            /* In a fleet the claim left it out already (Engine::plan): on the card it would come
+            /* In a fleet the claim left it out already (DeviceRuntime::plan): on the card it would come
              * out of the cache's floor. */
             if (emb_asked || broker_) {
                 RAD_ERR("--embedding-placement ram: the token embedding (%s a rank, pinned on "
@@ -575,7 +575,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
      * pins a whole tower (encoders are not sharded). Decided before the n-gram table, whose tests
      * need the final statics and the pools still to be allocated. A rank's tower bytes leave out
      * the lookup tables the embedding pins (tower_pin_bytes); the pin, the card test below and
-     * the split in Engine::plan all read that figure. */
+     * the split in DeviceRuntime::plan all read that figure. */
     std::vector<int64_t> tower_bytes;
     for (const WeightFootprint& wf : wfs) tower_bytes.push_back(tower_pin_bytes(wf, emb));
     int64_t tower_max = 0;
@@ -791,12 +791,12 @@ bool is_container(const std::string& path) {
 
 }  /* namespace */
 
-WeightSourceFn Engine::sources() const {
+WeightSourceFn DeviceRuntime::sources() const {
     if (file_) return rad_container_sources(*file_);
     return ckpt_src_ ? ckpt_src_->fn() : WeightSourceFn{};
 }
 
-int Engine::read_metadata() {
+int DeviceRuntime::read_metadata() {
     if (!is_container(cfg_.model)) return read_checkpoint_metadata();
     file_ = std::make_unique<RadFile>();
     RAD_TRY(file_->open(cfg_.model.c_str()));
@@ -870,7 +870,7 @@ int Engine::read_metadata() {
 /* A checkpoint served directly (spec §4.3): config.json or the GGUF header is the metadata, read
  * as rad-convert reads it, and its tensors are the weights. Only encodings served as stored are
  * answered (CheckpointSources); weights needing quantisation are refused after declare. */
-int Engine::read_checkpoint_metadata() {
+int DeviceRuntime::read_checkpoint_metadata() {
     ckpt_ = std::make_unique<Checkpoint>();
     RAD_TRY(ckpt_->open(cfg_.model));
     ckpt_src_ = std::make_unique<CheckpointSources>(*ckpt_);
@@ -904,7 +904,7 @@ int Engine::read_checkpoint_metadata() {
  * where the architecture's reader takes them, so a container serves past its trained context
  * without reconversion. A drafter gets the same factor over its own trained length. Then log the
  * rotary and warn if the context exceeds its reach. */
-int Engine::apply_rope_scaling() {
+int DeviceRuntime::apply_rope_scaling() {
     RopeSpec spec;
     if (!rope_spec_parse(cfg_.rope_scaling.c_str(), &spec)) {
         RAD_ERR("--rope-scaling '%s': yarn:FACTOR (above 1) with an optional :ORIG, or none",
@@ -950,10 +950,12 @@ int Engine::apply_rope_scaling() {
 }
 
 /* ================================================================== 3 + 4. plugins, declare */
-int Engine::load_plugins() {
+int DeviceRuntime::load_plugins() {
     int s = rad_tools_load_plugins(cfg_.radiance_home, cfg_.kernel_hierarchy,
-                                   meta_.arch_id, meta_.quant ? meta_.quant : "", &plugins_,
-                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None);
+                                   program_lowerer_ ? "" : meta_.arch_id,
+                                   meta_.quant ? meta_.quant : "", &plugins_,
+                                   ckpt_ && ckpt_->imports() != Checkpoint::Import::None,
+                                   !program_lowerer_);
     if (s < 0) {
         /* rad_tools_load_plugins already logged why. A checkpoint whose quantisation the import
          * refused keeps the tool's descriptor, which no plugin claims; the refusal is the reason. */
@@ -964,6 +966,12 @@ int Engine::load_plugins() {
         return s;
     }
 
+    if (program_lowerer_) {
+        plugins_.lowerer = program_lowerer_;
+        plugins_.arch_plugin = program_lowerer_->name;
+        plugins_.arch_version = "v2";
+        plugins_.arch_id = meta_.arch_id;
+    }
     reg_ = rad_tools_registry().share();
     plugins_.registry = reg_.get();
     {
@@ -973,12 +981,12 @@ int Engine::load_plugins() {
         reg_->set_tp_group(base);
     }
     const Plugin* ap = reg_->plugin(plugins_.arch_plugin);
-    arch_step_ = ap ? ap->arch_step : nullptr;
-    arch_pass_key_ = ap ? ap->arch_pass_key : nullptr;
+    arch_step_ = program_lowerer_ ? program_lowerer_->step : ap ? ap->arch_step : nullptr;
+    arch_pass_key_ = program_lowerer_ ? program_lowerer_->pass_key : ap ? ap->arch_pass_key : nullptr;
     return RAD_OK;
 }
 
-RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
+RadBuildCtx DeviceRuntime::build_ctx(int rank, int64_t max_tok) const {
     RadBuildCtx bc{};
     bc.rank       = rank;
     bc.slot_base  = slot_base_;
@@ -1032,7 +1040,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     return bc;
 }
 
-int Engine::declare() {
+int DeviceRuntime::declare() {
     /* An architecture that declares no streamed ops cannot stream, so with --kv-resident set on one
      * the flag is turned off here, with the decision named, before anything is planned for it. */
     (void)rad_tools_probe(plugins_, meta_, &arch_probe_, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
@@ -1495,7 +1503,7 @@ int Engine::declare() {
         /* A hole refuses startup: the bands come from this run's limits, so a request can land in
          * one, and that step would fail at issue and stop the engine. --debug-graph serves nothing,
          * so it continues to print the graph and reports the holes in its exit status
-         * (Engine::dump). */
+         * (DeviceRuntime::dump). */
         for (const MissReport& m : rep)
             if (!m.device.empty() && !cfg_.debug_graph) {
                 if (m.lossy_wire)
@@ -1614,7 +1622,7 @@ static constexpr int64_t kArenaGuard = 1ll << 20;
  * step is at most the shared size, and at this level the span's extra rows are lent.
  *
  * A refused level is simply dropped. */
-void Engine::probe_arena_levels() {
+void DeviceRuntime::probe_arena_levels() {
     for (auto& r : ranks_) r->arena_levels.clear();
     RadArchProbe pb{};
     (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
@@ -1716,7 +1724,7 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
     return RAD_OK;
 }
 
-int Engine::plan() {
+int DeviceRuntime::plan() {
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
      * writes it into Config; per-rank resolution would let rank 1 measure a card rank 0 already
@@ -2210,8 +2218,7 @@ int Engine::plan() {
         }
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
-        Planner planner(in);
-        s = planner.plan(&r->plan);
+        s = r->heat.plan_initial(in,&r->plan);
         if (cfg_.debug_placement || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
@@ -3622,7 +3629,7 @@ static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneSha
  * relayout pool, which writes the destination. Every source range must lie inside its plane:
  * offsets depend on the rank index (rank 0 always starts at the plane's start, so it never
  * exercises the arithmetic), and an overrun would read the wrong weight. The load's walk and a
- * restore's refill (Engine::refill_weights) both plan through here. */
+ * restore's refill (DeviceRuntime::refill_weights) both plan through here. */
 static int plan_container_weight(RadFile& file, const RadFileEntry& ent, const Program& prog,
                                  size_t wi, const PlaneShare* sh, int rank, int device,
                                  uint8_t* dst0, bool dev, std::vector<LoadRun>& runs,
@@ -3683,7 +3690,7 @@ static int plan_container_weight(RadFile& file, const RadFileEntry& ent, const P
     return RAD_OK;
 }
 
-int Engine::load_weights() {
+int DeviceRuntime::load_weights() {
     int64_t total = 0, n_loaded = 0, n_missing = 0;
     /* Counted apart from `n_loaded`: mapped weights are published in place, not loaded. */
     int64_t n_mapped = 0, mapped_bytes = 0;
@@ -3721,6 +3728,7 @@ int Engine::load_weights() {
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
         RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        r->mover.bind_policy(&r->heat);
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -4015,7 +4023,7 @@ int Engine::load_weights() {
     return RAD_OK;
 }
 
-int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
+int DeviceRuntime::refill_weights(const std::vector<PageSpan>& spans, const char* what,
                            const std::function<int()>& before_writes) {
     if (spans.empty()) return RAD_OK;
     if (!file_) {
@@ -4124,7 +4132,7 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
     return RAD_OK;
 }
 
-int64_t Engine::fill_host(int64_t max_bytes) {
+int64_t DeviceRuntime::fill_host(int64_t max_bytes) {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
     int64_t n = dev_page_fill_host(owner_, max_bytes);
     if (n < 0 || n >= max_bytes || !file_) return n;
@@ -4172,7 +4180,7 @@ int64_t Engine::fill_host(int64_t max_bytes) {
  * mapped tables read through and to the host's other work. It is pinned before the host
  * activation arenas and the prefix cache's host tier, so their bytes count as still to come;
  * on a card the amdgpu pin cap bounds it too. */
-int Engine::size_checkpoint_store(int64_t slot, const char* what) {
+int DeviceRuntime::size_checkpoint_store(int64_t slot, const char* what) {
     if (slot <= 0 || !cfg_.prefix_cache) {
         cfg_.checkpoint_slots = 0;
         decide("--checkpoint-slots", "0",
@@ -4267,8 +4275,8 @@ int Engine::size_checkpoint_store(int64_t slot, const char* what) {
     return RAD_OK;
 }
 
-int Engine::configure_kv() {
-    /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
+int DeviceRuntime::configure_kv() {
+    /* Resolved once, for the cache below and Scheduler::init later (see DeviceRuntime::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
     if (geo_.checkpoint_interval != cfg_.checkpoint_interval)
         decide("--checkpoint-interval",
@@ -4423,7 +4431,9 @@ int Engine::configure_kv() {
     }
     for (auto& r : ranks_) {
         LogRank lr(r->index);
-        RAD_TRY(r->prefix.configure(cfg_, &r->kv, geo_.checkpoint_interval));
+        Config prefix_config=cfg_;
+        if (sched_.externally_planned()) prefix_config.prefix_cache=false;
+        RAD_TRY(r->prefix.configure(prefix_config, &r->kv, geo_.checkpoint_interval));
         r->prefix.set_exact_chunk_grid(geo_.exact && !geo_.window_ckpt ? geo_.grid : 0,
                                        geo_.grid_origin);
     }
@@ -4630,7 +4640,7 @@ int Engine::configure_kv() {
  * part, runs beside other engines'. */
 static std::mutex g_bringup_mu;
 
-int Engine::start() {
+int DeviceRuntime::start() {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
     std::unique_lock<std::mutex> bringup(g_bringup_mu);
     bringup_lk_ = &bringup;
@@ -4730,7 +4740,7 @@ int Engine::start() {
 
     ranks_.clear();
     for (int i = 0; i < cfg_.tp; ++i) {
-        auto r = std::make_unique<Rank>();
+        auto r = std::make_unique<Rank>(placement_factory_?placement_factory_(i):std::make_unique<HeatEngine>());
         r->index  = i;
         r->device = devs[i];
         ranks_.push_back(std::move(r));
@@ -4943,7 +4953,7 @@ int Engine::start() {
     }
     /* The next-layer expert prefetch, where one rank's experts sit in a pinned pool for routed GEMMs
      * to read over the link (core/runtime/xprefetch.h). Its stream and ring are in the VRAM budget
-     * (xp_device_bytes, Engine::plan). Off under --deterministic, and off over several ranks: there
+     * (xp_device_bytes, DeviceRuntime::plan). Off under --deterministic, and off over several ranks: there
      * each card keeps most of its experts, a copy saves little, and a pass with the prefetch's
      * stream beside it starts every ordered dispatch about 11 us later (Qwen3.8-Flash-Next at
      * --tp 2, one sequence: 724 ordered starts a pass, 20.5 ms a step against 10.1 without it; four
@@ -5267,11 +5277,11 @@ int Engine::start() {
     return RAD_OK;
 }
 
-const Program& Engine::program() const { return ranks_[0]->program; }
+const Program& DeviceRuntime::program() const { return ranks_[0]->program; }
 
 /* ================================================================== dump */
-/* --debug-graph (spec §16); see Engine::dump in engine.h. */
-int Engine::dump() {
+/* --debug-graph (spec §16); see DeviceRuntime::dump in engine.h. */
+int DeviceRuntime::dump() {
     Program& p = ranks_[0]->program;
     fputs(dump_graph_str(p, nullptr).c_str(), stdout);
     if (cfg_.debug_selection) fputs(reg_->selection_table().c_str(), stdout);
@@ -5286,7 +5296,7 @@ int Engine::dump() {
 /* The vocabulary comes from the model source: the container's vocab section, a GGUF header, or
  * tokenizer.json beside a checkpoint. A missing one is refused here rather than at the first
  * request (spec §4.2, §12). */
-int Engine::load_vocab() {
+int DeviceRuntime::load_vocab() {
     VocabBuild vb;
     if (file_) {
         VocabSection vs = file_->vocab();
