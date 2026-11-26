@@ -8,6 +8,7 @@ then taking its byte runs, and the partial outputs of a shard cover must sum to 
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -201,16 +202,16 @@ def _fp8(g, i, device="cpu"):
 
 
 @cuda
-@pytest.mark.parametrize("fmt", ["nvfp4", "ds_mxfp4", "fp8"])
+@pytest.mark.parametrize("fmt,intermediate,partitions", [("nvfp4", 1024, 4), ("nvfp4", 640, 2), ("ds_mxfp4", 1024, 4), ("fp8", 1024, 4)])
 @pytest.mark.parametrize("is_prefill", [False, True])
-def test_kernel_shard_outputs_sum_to_full(fmt, is_prefill):
+def test_kernel_shard_outputs_sum_to_full(fmt, intermediate, partitions, is_prefill):
     """The GPU kernels accept shard-width banks, and a TP-style cover reproduces the unsharded output.
 
     FP8's padded scale banks cannot be fetched out of a wider bank, so it serves expert TP from banks of
     exactly the GPU's slice (``--moe-host-pool rank``); this is that path."""
     make_method, make_pieces = {**FORMATS, "fp8": (lambda i: Fp8BlockMoEMethod(_cfg(i)), _fp8)}[fmt]
     device = torch.device("cuda")
-    i, tokens = 1024, 3
+    i, tokens = intermediate, 3
     slicing = make_method(i).expert_slicing()
     g = torch.Generator().manual_seed(3)
     pieces = make_pieces(g, i)  # packed on the host, as the loader does
@@ -226,7 +227,7 @@ def test_kernel_shard_outputs_sum_to_full(fmt, is_prefill):
         return slicing.kernel.apply(layer, x, weights, ids, ExpertView(banks, n=E), is_prefill=is_prefill).float()
 
     full = run(Interval(0, i))
-    total = sum(run(v) for v in Interval.split(i, 4, align=slicing.alignment))
+    total = sum(run(v) for v in Interval.split(i, partitions, align=slicing.alignment))
     torch.testing.assert_close(total, full, rtol=2e-2, atol=2e-2 * float(full.abs().max()))
 
 
@@ -304,7 +305,10 @@ def _nvfp4_banks(stored, allocate):
                               shard=stored, allocate=allocate)
 
 
-def test_shared_arena_banks_hold_the_shard_and_map_across_processes():
+@pytest.mark.parametrize("python_memfd", [True, False])
+def test_shared_arena_banks_hold_the_shard_and_map_across_processes(python_memfd, monkeypatch):
+    if not python_memfd:
+        monkeypatch.delattr(os, "memfd_create", raising=False)
     from freetoken.moe.shared_banks import SharedBankArena, arena_bytes, attach_arena
 
     method = FORMATS["nvfp4"][0](1024)

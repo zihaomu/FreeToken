@@ -383,6 +383,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
         spec_drafts=_QWEN4_EXP_DRAFTS,
+        parallel_plan="build_parallel_plan",
     ),
     # llama.cpp qwen4exp GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Qwen4ExpGGUFForCausalLM": ModelSpec(

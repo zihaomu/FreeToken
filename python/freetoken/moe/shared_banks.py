@@ -57,6 +57,20 @@ def _round_page(n: int) -> int:
     return -(-n // _PAGE) * _PAGE
 
 
+def _memfd(name: str) -> int:
+    # Some portable Python builds omit the wrapper although Linux/glibc provide the call.
+    if create := getattr(os, "memfd_create", None):
+        return create(name, 0)
+    create = ctypes.CDLL(None, use_errno=True).memfd_create
+    create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    create.restype = ctypes.c_int
+    fd = create(name.encode(), 0)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return fd
+
+
 class SharedBank:
     """One bank carved out of a :class:`SharedBankArena`; quacks like ``host_banks.HostBank`` for the bank builder."""
 
@@ -95,7 +109,7 @@ class SharedBankArena:
     def __init__(self, nbytes: int, node: int | None):
         self.size = _round_page(max(nbytes, 1))
         self.node = node
-        self.fd = os.memfd_create("freetoken-expert-banks", 0)
+        self.fd = _memfd("freetoken-expert-banks")
         os.ftruncate(self.fd, self.size)
         self.buffer = mmap.mmap(self.fd, self.size, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
         self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self.buffer))

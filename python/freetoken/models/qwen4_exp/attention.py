@@ -19,9 +19,12 @@ from typing import TYPE_CHECKING, Protocol
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
+
+from .multi import dense_tp
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -118,16 +121,24 @@ class Qwen4ExpAttention(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "") -> None:
         self.layer_id = layer_id
-        self.num_q = config.num_qo_heads
-        self.num_kv = config.num_kv_heads
+        self._tp_size = dense_tp(config)
+        self._tp_comm = DistributedCommunicator()
+        self.num_q = config.num_qo_heads // self._tp_size
+        self.num_kv = config.num_kv_heads // self._tp_size
         self.head_dim = config.head_dim
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False,
-            quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
-        )
+        if self._tp_size > 1:
+            self.qkv_proj = LinearReplicated(
+                config.hidden_size, sum(self._qkv_split), has_bias=False, output_sizes=self._qkv_split,
+                quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+            )
+        else:
+            self.qkv_proj = LinearColParallelMerged(
+                config.hidden_size, self._qkv_split, has_bias=False,
+                quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
+            )
         self.o_proj = LinearReplicated(
             self.qo_attn_dim, config.hidden_size, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.o_proj",
@@ -164,7 +175,8 @@ class Qwen4ExpAttention(BaseOP):
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )
         gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
-        return self.o_proj.forward(gated)
+        result = self.o_proj.forward(gated)
+        return self._tp_comm.all_reduce(result) if self._tp_size > 1 else result
 
 
 class TorchDenseQSAReference:

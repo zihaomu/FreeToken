@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
@@ -32,8 +33,15 @@ class GatedDeltaNet(BaseOP):
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "silu",
         *, quant_config: QuantConfig | None = None, prefix: str = "", out_heads_tiled: bool = False,
+        tp_size: int = 1,
     ):
         self.layer_id = layer_id
+        if num_k_heads % tp_size or num_v_heads % tp_size:
+            raise ValueError(f"GDN heads {num_k_heads}/{num_v_heads} cannot split over TP={tp_size}")
+        num_k_heads //= tp_size
+        num_v_heads //= tp_size
+        self._tp_size = tp_size
+        self._tp_comm = DistributedCommunicator()
         self._out_heads_tiled = out_heads_tiled
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
@@ -54,6 +62,8 @@ class GatedDeltaNet(BaseOP):
         self._split_in_proj = (
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
+        if tp_size > 1 and self._split_in_proj:
+            raise ValueError("GDN head-parallel projections currently require unquantized dense weights")
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._split_in_proj:
@@ -67,10 +77,16 @@ class GatedDeltaNet(BaseOP):
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
-                quant_config=quant_config, prefix=f"{prefix}.in_proj",
-            )
+            if tp_size > 1:
+                self.in_proj = LinearReplicated(
+                    hidden_size, sum(self._in_proj_split), has_bias=False, output_sizes=self._in_proj_split,
+                    quant_config=quant_config, prefix=f"{prefix}.in_proj",
+                )
+            else:
+                self.in_proj = LinearColParallelMerged(
+                    hidden_size, self._in_proj_split, has_bias=False,
+                    quant_config=quant_config, prefix=f"{prefix}.in_proj",
+                )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
@@ -220,7 +236,8 @@ class GatedDeltaNet(BaseOP):
             # grouped value heads (k-head major) -> tiled (k-head minor), the column order of a GGUF ssm_out
             r = self.num_v_heads // self.num_k_heads
             out = out.view(total, self.num_k_heads, r, self.head_v_dim).transpose(1, 2).reshape(total, -1)
-        return self.out_proj.forward(out)
+        result = self.out_proj.forward(out)
+        return self._tp_comm.all_reduce(result) if self._tp_size > 1 else result
 
 
 __all__ = ["GatedDeltaNet"]

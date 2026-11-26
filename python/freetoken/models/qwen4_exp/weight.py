@@ -263,8 +263,8 @@ def iter_weights(
     Fusions, per role: attention q|k|v -> ``qkv_proj``; GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, or ``in_proj_qkvz`` + ``in_proj_ba`` when qkv|z is quantized; shared-expert gate|up -> ``gate_up_proj``; each per-layer HC's ``input_mix_weight_down`` | ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the routed experts are NVFP4 and always come from the offload cache's expert reader.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
+    if get_tp_info().size > 1 and include_vision:
+        raise NotImplementedError("qwen4_exp tensor-parallel weight loading requires text-only mode")
     if not include_non_moe:
         return
 

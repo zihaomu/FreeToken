@@ -27,6 +27,7 @@ from .attention import Qwen4ExpAttention
 from .config import PLE_NGRAM_STATE
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
+from .multi import dense_tp
 from .ple import PLELayer
 from freetoken.models.blocks import embed_input_ids
 from freetoken.models.qwen3_vl.vision import Qwen3VLVisionModel, QwenVLVisionMixin
@@ -54,6 +55,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         quant_config=config.quant,
         prefix=prefix,
         out_heads_tiled=config.qwen4_args.gdn_out_heads_tiled,
+        tp_size=dense_tp(config),
     )
 
 

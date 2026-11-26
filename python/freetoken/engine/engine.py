@@ -543,11 +543,12 @@ class Engine:
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
+        # The expert-placement meta model may construct attention's cached RoPE buffers too.
+        set_rope_device(self.device)
         # the routed experts split across the ranks (the plan's expert group), their input all-reduced by attention
         self.split_experts = self._place_experts(config) if self.parallel_plan is not None and self.parallel_plan.experts is not None else None
 
         # ======================= Model initialization ========================
-        set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._load_weights(config)
@@ -717,6 +718,9 @@ class Engine:
         return split
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        if torch.version.hip is not None and config.tp_info.size > 1 and config.use_pynccl:
+            logger.warning_rank0("ROCm tensor parallelism uses Torch/RCCL; disabling the CUDA-only PyNCCL wrapper")
+            object.__setattr__(config, "use_pynccl", False)
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -2015,6 +2019,8 @@ def _build_parallel_plan(config: EngineConfig):
     """
     if config.tp_info.size == 1:
         return None
+    if getattr(config.model_config, "qwen4_args", None) is not None and config.speculative_algorithm is not None:
+        raise ValueError("Qwen3.8 TP2 speculative decoding is not supported yet")
     from freetoken.distributed.plan import ParallelArgs
     from freetoken.models.register import build_parallel_plan
 

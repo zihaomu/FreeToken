@@ -40,6 +40,96 @@ E, I = 3, 6  # routed experts, moe_intermediate_size
 NGRAM_DIM, NGRAM_ROWS, NGRAM_SHARDS = 4, 7, 4
 
 
+@pytest.mark.parametrize("projection", ["linear_attn.in_proj", "linear_attn.conv1d", "self_attn.qkv_proj", "mlp.shared_expert.gate_up_proj"])
+def test_tp_fused_projections_reconstruct_independent_dense_outputs(projection):
+    from freetoken.distributed.plan import ParallelArgs
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.multi import build_parallel_plan
+
+    config = parse_config(hf_config())
+    plans = [build_parallel_plan(config, ParallelArgs(rank, 2)) for rank in (0, 1)]
+    group = config.linear_attention_group()
+    kd = group.num_key_heads * group.key_head_dim
+    vd = group.num_value_heads * group.value_head_dim
+    widths = {"linear_attn.in_proj": [kd, kd, vd, vd, group.num_value_heads, group.num_value_heads],
+              "linear_attn.conv1d": [kd, kd, vd],
+              "self_attn.qkv_proj": [2 * config.num_qo_heads * config.head_dim,
+                                     config.num_kv_heads * config.head_dim, config.num_kv_heads * config.head_dim],
+              "mlp.shared_expert.gate_up_proj": [config.shared_expert_intermediate_size] * 2}[projection]
+    torch.manual_seed(951)
+    leaves = [torch.randn(n, 7, dtype=torch.float64) for n in widths]
+    x = torch.randn(3, 7, dtype=torch.float64)
+    weights = torch.cat(leaves)
+    name = f"model.layers.0.{projection}.weight"
+    local = [torch.nn.functional.linear(x, plan.shard(name, weights)).split([n // 2 for n in widths], -1) for plan in plans]
+    restored = torch.cat([torch.cat([local[rank][part] for rank in (0, 1)], -1) for part in range(len(widths))], -1)
+    expected = torch.cat([torch.nn.functional.linear(x, w) for w in leaves], -1)
+    torch.testing.assert_close(restored, expected, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("projection", ["linear_attn.out_proj", "self_attn.o_proj", "mlp.shared_expert.down_proj"])
+def test_tp_output_partial_sums_match_whole_projection(projection):
+    from freetoken.distributed.plan import ParallelArgs
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.multi import build_parallel_plan
+
+    config = parse_config(hf_config())
+    torch.manual_seed(952)
+    weight, x = torch.randn(13, 18, dtype=torch.float64), torch.randn(5, 18, dtype=torch.float64)
+    partials = []
+    for rank in (0, 1):
+        plan = build_parallel_plan(config, ParallelArgs(rank, 2))
+        partials.append(torch.nn.functional.linear(x[:, rank * 9:(rank + 1) * 9], plan.shard(f"model.layers.0.{projection}.weight", weight)))
+    torch.testing.assert_close(sum(partials), torch.nn.functional.linear(x, weight), atol=1e-12, rtol=1e-12)
+
+
+def test_tp_checkpoint_partitions_match_local_model_and_state(tmp_path, monkeypatch):
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedInfo
+    from freetoken.distributed.plan import ParallelArgs
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _meta_model
+    from freetoken.layers import rotary
+    from freetoken.kvcache.linear_state_pool import _linear_local_dims
+    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
+    from freetoken.models.qwen4_exp.multi import build_parallel_plan
+
+    raw = _raw_checkpoint()
+    for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"]:
+        raw[name] = torch.cat([raw[name], torch.zeros_like(raw[name][:1])])
+    folder, _ = _write_checkpoint(tmp_path, raw, None)
+    data = json.loads((tmp_path / "config.json").read_text())
+    data["text_config"]["vocab_size"] = 12
+    data["text_config"]["ple_embed_dim"] = H
+    data["text_config"]["indexer_n_heads"] = 4
+    (tmp_path / "config.json").write_text(json.dumps(data))
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(0, 1))
+    whole = _load(folder, vision=False)
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))
+    try:
+        for rank in (0, 1):
+            monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank, 2))
+            config = EngineConfig(model_path=folder, tp_info=info._TP_INFO, dtype=torch.bfloat16,
+                                  moe_strategy="offload", mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+            plan = build_parallel_plan(config.model_config, ParallelArgs(rank, 2))
+            plan.place_experts(rank * (I // 2), (rank + 1) * (I // 2))
+            object.__setattr__(config.model_config, "parallel_plan", plan)
+            rotary.get_rope.cache_clear()
+            model = _meta_model(config, "gpu")
+            plan.bind(model, None)
+            state = model.state_dict()
+            for name, value in whole.items():
+                assert name in state, name
+                assert plan.shard(name, value).shape == state[name].shape, name
+            _, conv, values, keys = _linear_local_dims(config.model_config.linear_attention_group(), 2)
+            gdn = model.model.layers.op_list[0].linear_attn
+            assert (conv, values, keys) == (gdn.conv_dim, gdn.num_v_heads, gdn.num_k_heads)
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _tp_info():
     if try_get_tp_info() is None:
