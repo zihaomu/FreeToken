@@ -186,6 +186,28 @@ class LinearAttnBackend(BaseAttnBackend):
         # the GDN and KDA layers call their fla kernels themselves on batch.fla_metadata
         raise NotImplementedError("linear-attention layers run their own kernels")
 
+    @torch.inference_mode()
+    def warmup_gdn_prefill(self, lengths: list[int]) -> None:
+        """Warm the rank-local varlen recurrence without issuing model collectives or writing request state."""
+        from freetoken.kernel.fla import chunk_gated_delta_rule
+
+        state = torch.zeros_like(self.pool.recurrent_states[0, :1])
+        _, value_heads, key_dim, value_dim = state.shape
+        slot = torch.zeros(1, dtype=torch.int32, device=self.device)
+        dtype = self.pool.conv_states.dtype
+        for length in lengths:
+            q = torch.zeros((1, length, self.pool.local_key_heads, key_dim), dtype=dtype, device=self.device)
+            k = torch.zeros_like(q)
+            v = torch.zeros((1, length, value_heads, value_dim), dtype=dtype, device=self.device)
+            g = torch.full((1, length, value_heads), -1.0, dtype=torch.float32, device=self.device)
+            beta = torch.full_like(g, 0.5)
+            chunk_gated_delta_rule(
+                q=q, k=k, v=v, g=g, beta=beta, scale=key_dim ** -0.5,
+                initial_state=state, initial_state_indices=slot,
+                cu_seqlens=torch.tensor([0, length], dtype=torch.int64, device=self.device),
+                head_first=False, use_qk_l2norm_in_kernel=True,
+            )
+
     def prepare_metadata(self, batch: "Batch") -> None:
         batch.fla_metadata = build_fla_metadata(batch, self.device, self.pool)
 

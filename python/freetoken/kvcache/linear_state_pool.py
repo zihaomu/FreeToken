@@ -62,7 +62,7 @@ class LinearStatePool:
         self._device = device
         self._conv_dtype = dtype
 
-        n_layers, local_conv_dim, local_v_heads, self._local_k_heads = _linear_local_dims(group, tp_size)
+        n_layers, local_conv_dim, local_v_heads, self.local_key_heads = _linear_local_dims(group, tp_size)
 
         # conv left-context: the last (kernel-1) timesteps of the conv input stream.
         self.conv_states = torch.zeros(
@@ -275,7 +275,7 @@ class LinearVerifyScratch:
     def __init__(self, pool: LinearStatePool, max_bs: int, rows_per_req: int) -> None:
         num_layers, _, hv, k_dim, v_dim = pool.recurrent_states.shape
         _, _, conv_dim, km1 = pool.conv_states.shape
-        hk = pool._local_k_heads
+        hk = pool.local_key_heads
         device = pool.recurrent_states.device
         rows = (num_layers, max_bs, rows_per_req)
         f32 = dict(dtype=torch.float32, device=device)

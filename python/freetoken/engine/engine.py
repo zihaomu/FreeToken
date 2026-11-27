@@ -7,6 +7,7 @@ import gc
 import math
 import os
 from datetime import timedelta
+from time import monotonic
 from typing import Any, Callable, Dict, Iterable, NamedTuple, Tuple
 
 import torch
@@ -698,9 +699,17 @@ class Engine:
 
         # ======================= Graph capture initialization ========================
         self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
+        prefill_backend = config.attention_backend.split(",")[0]
+        if prefill_backend == "triton":
             self._warmup_prefill()
+        elif prefill_backend == "qsa_sparse" and linear_group is not None and linear_group.variant == "gdn":
+            limit = min(self.max_seq_len, config.max_forward_len)
+            if limit > 0:
+                lengths = sorted({min(31, limit), min(128, limit)})
+                started = monotonic()
+                self.linear_backend.warmup_gdn_prefill(lengths)
+                self.stream.synchronize()
+                logger.info_rank0(f"GDN prefill warmup complete for lengths {lengths} in {monotonic() - started:.3f} s")
 
     def _place_experts(self, config: EngineConfig):
         """Place the plan's expert group (``moe/split_experts.py``) and give this rank's slice to the MoE layers built next."""
