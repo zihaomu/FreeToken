@@ -202,6 +202,9 @@ class OffloadMoeCache:
         # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
         # hybrid: locked (unpinned) layers that keep slots of their own pools and fetch part of their misses through locked_fetch's pinned staging
+        self.staged_rows = 0
+        self.prefill_host_staging = None
+        self.decode_host_fetch = None
         self.locked_hybrid: frozenset = frozenset()
         self.locked_fetch = None  # moe.locked_fetch.LockedLayerFetch, set by the engine with locked_hybrid
         # Bank row layouts, set by set_bank_sources: layouts[g][k] is (dtype, row shape) of bank k (layouts of two quant tags may be equal), layer_layout[l] is layer l's g.
@@ -507,7 +510,10 @@ class OffloadMoeCache:
         unpinned = frozenset(
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
-        if unpinned:
+        if self.staged_rows:
+            if len(unpinned) != self.num_layers or self.decode_target != "gpu" or source_runs or self.prefill_hit_d2d:
+                raise ValueError("bounded staging needs unregistered per-rank banks and GPU expert slots")
+        elif unpinned:
             if not unpinned <= self.cpu_layer_ids:
                 raise ValueError(
                     f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
@@ -589,6 +595,13 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         self._slice_pools()
         self._build_copy_plan()
+        if self.staged_rows:
+            from freetoken.moe.locked_fetch import LockedLayerFetch, PrefillStaging
+
+            self.prefill_host_staging = PrefillStaging(self.device)
+            self.decode_host_fetch = LockedLayerFetch(self, list(range(self.num_layers)), {}, self.staged_rows, None)
+            logger.info(f"staged expert banks: {self.num_layers} pageable layers, {self.staged_rows} decode rows, "
+                        f"{self.prefill_host_staging.capacity_bytes // 2**20} MiB prefill staging")
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
@@ -988,6 +1001,9 @@ class OffloadMoeCache:
 
                 memcpy2d(self._shard_layer_desc[buffer_id][layer_id], torch.cuda.current_stream(self.device).cuda_stream)
                 return
+            if self.prefill_host_staging is not None:
+                self.prefill_host_staging.copy_layer(self.banks, self.stage_views(layer_id, buffer_id), layer_id)
+                return
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, buffer_id)):
                 view.copy_(per_layer[layer_id], non_blocking=True)
 
@@ -1168,6 +1184,8 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        if self.staged_rows and min(expert_ids.numel(), self.num_experts) > self.staged_rows:
+            raise ValueError("decode routes exceed the configured host staging capacity")
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(
@@ -1352,6 +1370,12 @@ class OffloadMoeCache:
                 memcpy2d(self._shard_layer_desc[0][layer_id], torch.cuda.current_stream(self.device).cuda_stream)
                 return
             self._shard_copy(self._shard_dst_pool[self.pool_of_layer[layer_id]], layer_id, self.evict_slots, self.src_indices, self.num_indices)
+            return
+        if self.decode_host_fetch is not None:
+            if self._pending_whole_layer:
+                self.prefill_host_staging.copy_layer(self.banks, self.stage_views(layer_id, 0), layer_id)
+            else:
+                self.decode_host_fetch.copy_rows(self, layer_id)
             return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:

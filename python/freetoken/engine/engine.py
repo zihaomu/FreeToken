@@ -1056,6 +1056,7 @@ class Engine:
         )
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
+        cache.staged_rows = self.split_experts.staged_rows if self.split_experts else 0
         if locked_fetch:
             cache.locked_hybrid = cpu_layer_ids
         cache.set_bank_sources(

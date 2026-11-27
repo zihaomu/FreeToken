@@ -173,6 +173,38 @@ def _copy_cpus(executor, count: int) -> list[int]:
     return cpus[:count]
 
 
+class PrefillStaging:
+    """Keep pageable expert weights on the CPU and bound asynchronous H2D to two pinned chunks."""
+
+    chunk_bytes = 16 << 20
+    capacity_bytes = 2 * chunk_bytes
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.buffers = [torch.empty(self.chunk_bytes, dtype=torch.uint8, device="cpu", pin_memory=True) for _ in range(2)]
+        self.done = [torch.cuda.Event() for _ in self.buffers]
+        self.used = [False] * len(self.buffers)
+        self.next_buffer = 0
+
+    def copy_layer(self, banks, destinations, layer: int) -> None:
+        stream = torch.cuda.current_stream(self.device)
+        for (sources, _), view in zip(banks, destinations, strict=True):
+            src = sources[layer].view(torch.uint8).view(-1)
+            dst = view.view(torch.uint8).view(-1)
+            assert src.numel() == dst.numel()
+            for offset in range(0, src.numel(), self.chunk_bytes):
+                i = self.next_buffer
+                self.next_buffer = (i + 1) % len(self.buffers)
+                if self.used[i]:
+                    self.done[i].synchronize()
+                part = src[offset:offset + self.chunk_bytes]
+                staging = self.buffers[i][:part.numel()]
+                staging.copy_(part)
+                dst[offset:offset + part.numel()].copy_(staging, non_blocking=True)
+                self.done[i].record(stream)
+                self.used[i] = True
+
+
 class LockedLayerFetch:
     """Staging and copy threads for the locked layers of one ``OffloadMoeCache``."""
 
@@ -205,9 +237,14 @@ class LockedLayerFetch:
             assert staging[role].numel() >= need[b], (role, staging[role].numel(), need[b])
         self.staging = [staging[role] for role in roles]
         self.staging_ptrs = torch.tensor([device_ptr(t) for t in self.staging], dtype=torch.int64, device=cache.device)
-        cpus = _copy_cpus(executor, _copy_threads())
+        if executor is None:
+            # No CPU executor owns dedicated cores here. Keep the inference process affinity.
+            cpus = [-1] * _copy_threads()
+        else:
+            cpus = _copy_cpus(executor, _copy_threads())
         # the executor's doorbell decision (FREETOKEN_CPU_MOE_FLAG_SYNC and the memop probe); without memops the gather spins on the GPU
-        memops = bool(getattr(executor, "_flag_sync", False))
+        memops = (_cpu_moe.memops_probe(torch.cuda.current_stream(cache.device).cuda_stream)
+                  if executor is None else bool(getattr(executor, "_flag_sync", False)))
         self._ext = _cpu_moe.LockedFetch(src, row_bytes, [t.data_ptr() for t in self.staging], max_fetch, cpus, memops)
         self._wait_flag = 0 if memops else self._ext.done_word()
         logger.info_rank0(
@@ -218,11 +255,13 @@ class LockedLayerFetch:
 
     def copy(self, cache, layer_id: int) -> None:
         """Stage and gather the rows the last hybrid ensure scheduled for ``layer_id``; graph capturable."""
+        assert cache._pending_fetch_cap == self.max_fetch, (cache._pending_fetch_cap, self.max_fetch)
+        self.copy_rows(cache, layer_id)
+
+    def copy_rows(self, cache, layer_id: int) -> None:
         from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
-        # the gather reads num_indices rows of the staging, which has max_fetch
-        assert cache._pending_fetch_cap == self.max_fetch, (cache._pending_fetch_cap, self.max_fetch)
-        self._ext.publish(torch.cuda.current_stream().cuda_stream, layer_id, cache.num_indices.data_ptr(), cache.src_indices.data_ptr())
+        self._ext.publish(torch.cuda.current_stream(cache.device).cuda_stream, layer_id, cache.num_indices.data_ptr(), cache.src_indices.data_ptr())
         fast_index_copy_multi_jit(
             cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer_id]],
             self.staging_ptrs,

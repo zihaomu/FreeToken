@@ -27,9 +27,10 @@ logger = init_logger(__name__)
 
 
 class SplitExperts:
-    def __init__(self, placement: ExpertPlacement, rank: int):
+    def __init__(self, placement: ExpertPlacement, rank: int, staged_rows: int = 0):
         self.placement = placement
         self.rank = rank
+        self.staged_rows = staged_rows
 
     @classmethod
     def place(cls, config: EngineConfig, group: ExpertGroup, method, layer_methods, *, device, cpu_group) -> SplitExperts:
@@ -92,7 +93,13 @@ class SplitExperts:
             split_check.enable(cpu_group, hybrid_split=cpu and mode == "numa")
             object.__setattr__(config, "cuda_graph_bs", [])  # the check syncs the host at every MoE layer
             logger.info_rank0("FREETOKEN_CHECK_SPLIT_EXPERTS=1: comparing every MoE layer's routes across ranks, without CUDA graphs")
-        return cls(placement, config.tp_info.rank)
+        staged_rows = 0
+        if os.environ.get("FREETOKEN_ROCM_STAGED_EXPERT_BANKS") == "1":
+            if not torch.version.hip or config.moe_strategy != "offload" or mode != "rank" or config.moe_cpu_layers:
+                raise ValueError("staged expert banks require ROCm split GPU offload with per-rank banks")
+            batch = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+            staged_rows = min(model_config.num_experts, batch * config.decode_rows_per_req * model_config.num_experts_per_tok)
+        return cls(placement, config.tp_info.rank, staged_rows)
 
     @property
     def shard(self) -> Interval:
@@ -130,7 +137,7 @@ class SplitExperts:
 
         return load_placed_expert_banks(
             self.placement, self.rank, method, None if config.use_dummy_weight else read,
-            num_experts=config.model_config.num_experts, num_layers=config.model_config.num_moe_layers, device=device,
+            num_experts=config.model_config.num_experts, num_layers=config.model_config.num_moe_layers, device=device, register_bank=not self.staged_rows,
         )
 
     def pinned_bank_bytes(self, config: EngineConfig, method) -> int:
@@ -140,6 +147,10 @@ class SplitExperts:
 
         bank = self.placement.bank_of(self.rank)
         layout = method.expert_slicing().layout_at(bank.interval.width)
+        if self.staged_rows:
+            from freetoken.moe.locked_fetch import PrefillStaging
+
+            return PrefillStaging.capacity_bytes + arena_bytes(layout, self.staged_rows, 1)
         return arena_bytes(layout, config.model_config.num_experts, config.model_config.num_moe_layers)
 
     def pin_hint(self) -> str:

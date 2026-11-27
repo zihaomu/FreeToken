@@ -167,7 +167,7 @@ def _raise_any(group, failure: BaseException | None) -> None:
 
 
 def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable | None, *, num_experts: int, num_layers: int,
-                             device: torch.device, timeout: float = 3 * 3600):
+                             device: torch.device, timeout: float = 3 * 3600, register_bank: bool = True):
     """This rank's host banks under ``placement``; a collective over the default process group.
 
     Every bank is a ``memfd`` arena bound to its NUMA node, created by its owner and mapped by all
@@ -268,7 +268,7 @@ def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable
     # fails now and then with "invalid argument". Each turn ends in _raise_any, so a refused pin fails every rank.
     for turn in range(max(len(b.ranks) for b in placement.banks)):
         failure = None
-        if bank.ranks.index(rank) == turn:
+        if register_bank and bank.ranks.index(rank) == turn:
             try:
                 host_register(addr, size)
             except BaseException as exc:
@@ -285,6 +285,7 @@ def load_placed_expert_banks(placement, rank: int, method, read_pieces: Callable
         down_alpha=alphas["down_alpha"].to(device, dtypes["down_alpha"]) if "down_alpha" in alphas else None,
         kind=method.kind, kernel=kernel.name, layout=kernel.layout(configs[i]),
         stored=bank.interval if bank.interval.width != slicing.intermediate else None,
+        layer_residency=None if register_bank else ["pageable"] * L,
     )
 
 
